@@ -51,8 +51,7 @@ CREATE TABLE IF NOT EXISTS file_metadata_template (
     CHECK (size_bytes >= 0),
     CHECK (creation_time_utc >= 0),
     CHECK (modification_time_utc >= 0),
-    CHECK (access_time_utc >= 0),
-    CHECK (file_mode GLOB '[drwx-]{10}')
+    CHECK (access_time_utc >= 0)
 ) WITHOUT ROWID;
 
 -- パーティション管理テーブル

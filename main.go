@@ -284,46 +284,82 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
+func formatFileMode(mode os.FileMode) string {
+    // 基本的なパーミッションビットをマスク
+    permBits := mode & os.ModePerm
+    
+    // ファイルタイプをチェック
+    var typeChar string
+    switch {
+    case mode&os.ModeDir != 0:
+        typeChar = "d"
+    case mode&os.ModeSymlink != 0:
+        typeChar = "l"
+    default:
+        typeChar = "-"
+    }
+    
+    // パーミッションを文字列に変換
+    result := typeChar
+    
+    // オーナーのパーミッション
+    result += map[bool]string{true: "r", false: "-"}[(permBits&0400) != 0]
+    result += map[bool]string{true: "w", false: "-"}[(permBits&0200) != 0]
+    result += map[bool]string{true: "x", false: "-"}[(permBits&0100) != 0]
+    
+    // グループのパーミッション
+    result += map[bool]string{true: "r", false: "-"}[(permBits&040) != 0]
+    result += map[bool]string{true: "w", false: "-"}[(permBits&020) != 0]
+    result += map[bool]string{true: "x", false: "-"}[(permBits&010) != 0]
+    
+    // その他のパーミッション
+    result += map[bool]string{true: "r", false: "-"}[(permBits&04) != 0]
+    result += map[bool]string{true: "w", false: "-"}[(permBits&02) != 0]
+    result += map[bool]string{true: "x", false: "-"}[(permBits&01) != 0]
+    
+    return result
+}
+
 func collectMetadata(path string, info os.FileInfo, relPath string, skipHash bool) FileMetadata {
-	stat := info.Sys().(*syscall.Stat_t)
-	
-	// macOS固有の属性を取得
-	var isSystem, isArchive bool
-	finderInfo := make([]byte, 32) // FinderInfoは32バイト
-	_, err := unix.Getxattr(path, "com.apple.FinderInfo", finderInfo)
-	if err == nil {
-		// Finder flagsの解析
-		isSystem = finderInfo[8]&uint8(0x04) != 0  // kIsSystemFileBit
-		isArchive = finderInfo[8]&uint8(0x20) != 0 // kIsArchiveBit
-	}
+    stat := info.Sys().(*syscall.Stat_t)
+    
+    // macOS固有の属性を取得
+    var isSystem, isArchive bool
+    finderInfo := make([]byte, 32) // FinderInfoは32バイト
+    _, err := unix.Getxattr(path, "com.apple.FinderInfo", finderInfo)
+    if err == nil {
+        // Finder flagsの解析
+        isSystem = finderInfo[8]&uint8(0x04) != 0  // kIsSystemFileBit
+        isArchive = finderInfo[8]&uint8(0x20) != 0 // kIsArchiveBit
+    }
 
-	// SHA256ハッシュの計算（ファイルの場合のみ）
-	var sha256Hash *string
-	if !skipHash && !info.IsDir() {
-		if hash, err := calculateSHA256(path); err == nil {
-			sha256Hash = &hash
-		}
-	}
+    // SHA256ハッシュの計算（ファイルの場合のみ）
+    var sha256Hash *string
+    if !skipHash && !info.IsDir() {
+        if hash, err := calculateSHA256(path); err == nil {
+            sha256Hash = &hash
+        }
+    }
 
-	return FileMetadata{
-		FilePath:           relPath,
-		FileName:           info.Name(),
-		Directory:          filepath.Dir(relPath),
-		SizeBytes:          info.Size(),
-		CreationTimeUTC:    stat.Birthtimespec.Sec,
-		ModificationTimeUTC: stat.Mtimespec.Sec,
-		AccessTimeUTC:      stat.Atimespec.Sec,
-		FileMode:           info.Mode().String(),
-		IsDirectory:        info.IsDir(),
-		IsFile:             !info.IsDir(),
-		IsSymlink:          info.Mode()&os.ModeSymlink != 0,
-		IsHidden:           strings.HasPrefix(filepath.Base(path), "."),
-		IsSystem:           isSystem,
-		IsArchive:          isArchive,
-		IsReadonly:         info.Mode()&0200 == 0,
-		FileExtension:      strings.ToLower(filepath.Ext(path)),
-		SHA256:             sha256Hash,
-	}
+    return FileMetadata{
+        FilePath:           relPath,
+        FileName:           info.Name(),
+        Directory:          filepath.Dir(relPath),
+        SizeBytes:          info.Size(),
+        CreationTimeUTC:    stat.Birthtimespec.Sec,
+        ModificationTimeUTC: stat.Mtimespec.Sec,
+        AccessTimeUTC:      stat.Atimespec.Sec,
+        FileMode:           formatFileMode(info.Mode()), // 新しい関数を使用
+        IsDirectory:        info.IsDir(),
+        IsFile:             !info.IsDir(),
+        IsSymlink:          info.Mode()&os.ModeSymlink != 0,
+        IsHidden:           strings.HasPrefix(filepath.Base(path), "."),
+        IsSystem:           isSystem,
+        IsArchive:          isArchive,
+        IsReadonly:         info.Mode()&0200 == 0,
+        FileExtension:      strings.ToLower(filepath.Ext(path)),
+        SHA256:             sha256Hash,
+    }
 }
 
 func calculateSHA256(path string) (string, error) {
