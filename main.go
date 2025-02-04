@@ -174,7 +174,11 @@ func main() {
 	// If merge mode is specified, perform merge and exit
 	if mergeSource != "" {
 		log.Printf("Merging database %s into %s...", mergeSource, dbPath)
-		if err := mergeDatabase(mergeSource, dbPath); err != nil {
+		if err := mergeDatabase(ctx, mergeSource, dbPath); err != nil {
+			if err == context.Canceled {
+				log.Println("Database merge cancelled by user")
+				return
+			}
 			log.Fatalf("Failed to merge database: %v", err)
 		}
 		log.Println("Database merge completed successfully")
@@ -515,7 +519,7 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-func mergeDatabase(sourceDB, destDB string) error {
+func mergeDatabase(ctx context.Context, sourceDB, destDB string) error {
 	source, err := sql.Open("sqlite3", sourceDB)
 	if err != nil {
 		return fmt.Errorf("failed to open source database: %v", err)
@@ -562,18 +566,23 @@ func mergeDatabase(sourceDB, destDB string) error {
 	// Map old dump IDs to new ones
 	dumpIDMap := make(map[int64]int64)
 	for rows.Next() {
-		var oldID, created, processed, fileCount, dirCount, totalSize int64
-		var storageName string
-		if err := rows.Scan(&oldID, &storageName, &created, &processed, &fileCount, &dirCount, &totalSize); err != nil {
-			return fmt.Errorf("failed to scan dump row: %v", err)
-		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			var oldID, created, processed, fileCount, dirCount, totalSize int64
+			var storageName string
+			if err := rows.Scan(&oldID, &storageName, &created, &processed, &fileCount, &dirCount, &totalSize); err != nil {
+				return fmt.Errorf("failed to scan dump row: %v", err)
+			}
 
-		newID := maxDumpID + oldID
-		dumpIDMap[oldID] = newID
+			newID := maxDumpID + oldID
+			dumpIDMap[oldID] = newID
 
-		_, err = dumpStmt.Exec(newID, storageName+"_merged", created, processed, fileCount, dirCount, totalSize)
-		if err != nil {
-			return fmt.Errorf("failed to insert dump: %v", err)
+			_, err = dumpStmt.Exec(newID, storageName+"_merged", created, processed, fileCount, dirCount, totalSize)
+			if err != nil {
+				return fmt.Errorf("failed to insert dump: %v", err)
+			}
 		}
 	}
 
@@ -597,44 +606,103 @@ func mergeDatabase(sourceDB, destDB string) error {
 	for oldDumpID := range dumpIDMap {
 		offset := 0
 		for {
-			query := `SELECT * FROM file_metadata_template WHERE dump_id = ? LIMIT ? OFFSET ?`
-			rows, err := source.Query(query, oldDumpID, batchSize, offset)
-			if err != nil {
-				return fmt.Errorf("failed to query metadata: %v", err)
-			}
-
-			count := 0
-			for rows.Next() {
-				var metadata FileMetadata
-				var dumpID int64
-				// Scan row into metadata struct
-				// ... (implement scanning logic)
-
-				// Insert with new dump_id
-				newDumpID := dumpIDMap[dumpID]
-				_, err = metadataStmt.Exec(
-					newDumpID, metadata.FilePath, metadata.FileName, metadata.Directory,
-					metadata.SizeBytes, metadata.CreationTimeUTC, metadata.ModificationTimeUTC,
-					metadata.AccessTimeUTC, metadata.FileMode, boolToInt(metadata.IsDirectory),
-					boolToInt(metadata.IsFile), boolToInt(metadata.IsSymlink),
-					boolToInt(metadata.IsHidden), boolToInt(metadata.IsSystem),
-					boolToInt(metadata.IsArchive), boolToInt(metadata.IsReadonly),
-					metadata.FileExtension, metadata.SHA256,
-				)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				query := `SELECT * FROM file_metadata_template WHERE dump_id = ? LIMIT ? OFFSET ?`
+				rows, err := source.Query(query, oldDumpID, batchSize, offset)
 				if err != nil {
-					rows.Close()
-					return fmt.Errorf("failed to insert metadata: %v", err)
+					return fmt.Errorf("failed to query metadata: %v", err)
 				}
-				count++
-			}
-			rows.Close()
 
-			if count < batchSize {
-				break
+				count := 0
+				for rows.Next() {
+					select {
+					case <-ctx.Done():
+						rows.Close()
+						return ctx.Err()
+					default:
+						var metadata FileMetadata
+						var dumpID int64
+						var sha256Str sql.NullString // For handling NULL values in sha256 field
+
+						err := rows.Scan(
+							&dumpID,
+							&metadata.FilePath,
+							&metadata.FileName,
+							&metadata.Directory,
+							&metadata.SizeBytes,
+							&metadata.CreationTimeUTC,
+							&metadata.ModificationTimeUTC,
+							&metadata.AccessTimeUTC,
+							&metadata.FileMode,
+							&metadata.IsDirectory,
+							&metadata.IsFile,
+							&metadata.IsSymlink,
+							&metadata.IsHidden,
+							&metadata.IsSystem,
+							&metadata.IsArchive,
+							&metadata.IsReadonly,
+							&metadata.FileExtension,
+							&sha256Str,
+						)
+						if err != nil {
+							rows.Close()
+							return fmt.Errorf("failed to scan metadata row: %v", err)
+						}
+
+						// Handle NULL sha256 values
+						if sha256Str.Valid {
+							metadata.SHA256 = &sha256Str.String
+						}
+
+						// Insert with new dump_id
+						newDumpID := dumpIDMap[dumpID]
+						_, err = metadataStmt.Exec(
+							newDumpID,
+							metadata.FilePath,
+							metadata.FileName,
+							metadata.Directory,
+							metadata.SizeBytes,
+							metadata.CreationTimeUTC,
+							metadata.ModificationTimeUTC,
+							metadata.AccessTimeUTC,
+							metadata.FileMode,
+							boolToInt(metadata.IsDirectory),
+							boolToInt(metadata.IsFile),
+							boolToInt(metadata.IsSymlink),
+							boolToInt(metadata.IsHidden),
+							boolToInt(metadata.IsSystem),
+							boolToInt(metadata.IsArchive),
+							boolToInt(metadata.IsReadonly),
+							metadata.FileExtension,
+							metadata.SHA256,
+						)
+						if err != nil {
+							rows.Close()
+							return fmt.Errorf("failed to insert metadata: %v", err)
+						}
+						count++
+					}
+				}
+				rows.Close()
+
+				if count < batchSize {
+					break
+				}
+				offset += batchSize
+
+				// Log progress
+				log.Printf("Processed %d records from dump_id %d", offset+count, oldDumpID)
 			}
-			offset += batchSize
 		}
 	}
 
-	return destTx.Commit()
+	// Final commit
+	if err := destTx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %v", err)
+	}
+
+	return nil
 }
