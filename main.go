@@ -169,7 +169,17 @@ func main() {
 		cancel() // Cancel context to notify goroutines
 	}()
 
-	storageName, rootDir, dbPath, skipHash := parseFlags()
+	storageName, rootDir, dbPath, skipHash, mergeSource := parseFlags()
+
+	// If merge mode is specified, perform merge and exit
+	if mergeSource != "" {
+		log.Printf("Merging database %s into %s...", mergeSource, dbPath)
+		if err := mergeDatabase(mergeSource, dbPath); err != nil {
+			log.Fatalf("Failed to merge database: %v", err)
+		}
+		log.Println("Database merge completed successfully")
+		return
+	}
 
 	// Set up database connection and setup
 	db, err := setupDatabase(dbPath)
@@ -303,18 +313,31 @@ func main() {
 	}
 }
 
-func parseFlags() (string, string, string, bool) {
+func parseFlags() (string, string, string, bool, string) {
 	storageName := flag.String("storage", "", "Storage name identifier")
 	rootDir := flag.String("root", "", "Root directory to scan")
 	dbPath := flag.String("db", "", "SQLite database path")
 	skipHash := flag.Bool("skip-hash", false, "Skip SHA256 hash calculation")
+	mergeSource := flag.String("merge", "", "Source database to merge from")
 	flag.Parse()
 
-	if *storageName == "" || *rootDir == "" || *dbPath == "" {
-		log.Fatal("All arguments are required: -storage, -root, -db")
+	// Validate normal mode
+	if *mergeSource == "" {
+		if *storageName == "" || *rootDir == "" || *dbPath == "" {
+			log.Fatal("All arguments are required: -storage, -root, -db")
+		}
+		return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource
 	}
 
-	return *storageName, *rootDir, *dbPath, *skipHash
+	// Validate merge mode
+	if *dbPath == "" {
+		log.Fatal("Destination database (-db) is required for merge operation")
+	}
+	if *mergeSource == *dbPath {
+		log.Fatal("Source and destination databases must be different")
+	}
+
+	return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource
 }
 
 func countFilesAndSize(rootDir string, stats *ProgressStats, ctx context.Context) error {
@@ -490,4 +513,128 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func mergeDatabase(sourceDB, destDB string) error {
+	source, err := sql.Open("sqlite3", sourceDB)
+	if err != nil {
+		return fmt.Errorf("failed to open source database: %v", err)
+	}
+	defer source.Close()
+
+	dest, err := sql.Open("sqlite3", destDB)
+	if err != nil {
+		return fmt.Errorf("failed to open destination database: %v", err)
+	}
+	defer dest.Close()
+
+	// Get the maximum dump_id from destination
+	var maxDumpID int64
+	err = dest.QueryRow("SELECT COALESCE(MAX(dump_id), 0) FROM dumps").Scan(&maxDumpID)
+	if err != nil {
+		return fmt.Errorf("failed to get max dump_id: %v", err)
+	}
+
+	// Start transaction
+	destTx, err := dest.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer destTx.Rollback()
+
+	// Copy dumps with updated IDs
+	rows, err := source.Query("SELECT dump_id, storage_name, created_at, processed_at, file_count, directory_count, total_size_bytes FROM dumps")
+	if err != nil {
+		return fmt.Errorf("failed to query source dumps: %v", err)
+	}
+	defer rows.Close()
+
+	// Prepare dump insert statement
+	dumpStmt, err := destTx.Prepare(`
+		INSERT INTO dumps (dump_id, storage_name, created_at, processed_at, file_count, directory_count, total_size_bytes)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare dump statement: %v", err)
+	}
+	defer dumpStmt.Close()
+
+	// Map old dump IDs to new ones
+	dumpIDMap := make(map[int64]int64)
+	for rows.Next() {
+		var oldID, created, processed, fileCount, dirCount, totalSize int64
+		var storageName string
+		if err := rows.Scan(&oldID, &storageName, &created, &processed, &fileCount, &dirCount, &totalSize); err != nil {
+			return fmt.Errorf("failed to scan dump row: %v", err)
+		}
+
+		newID := maxDumpID + oldID
+		dumpIDMap[oldID] = newID
+
+		_, err = dumpStmt.Exec(newID, storageName+"_merged", created, processed, fileCount, dirCount, totalSize)
+		if err != nil {
+			return fmt.Errorf("failed to insert dump: %v", err)
+		}
+	}
+
+	// Copy file metadata with updated dump_ids
+	metadataStmt, err := destTx.Prepare(`
+		INSERT INTO file_metadata_template (
+			dump_id, file_path, file_name, directory, size_bytes,
+			creation_time_utc, modification_time_utc, access_time_utc,
+			file_mode, is_directory, is_file, is_symlink,
+			is_hidden, is_system, is_archive, is_readonly,
+			file_extension, sha256
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare metadata statement: %v", err)
+	}
+	defer metadataStmt.Close()
+
+	// Process metadata in batches
+	const batchSize = 1000
+	for oldDumpID := range dumpIDMap {
+		offset := 0
+		for {
+			query := `SELECT * FROM file_metadata_template WHERE dump_id = ? LIMIT ? OFFSET ?`
+			rows, err := source.Query(query, oldDumpID, batchSize, offset)
+			if err != nil {
+				return fmt.Errorf("failed to query metadata: %v", err)
+			}
+
+			count := 0
+			for rows.Next() {
+				var metadata FileMetadata
+				var dumpID int64
+				// Scan row into metadata struct
+				// ... (implement scanning logic)
+
+				// Insert with new dump_id
+				newDumpID := dumpIDMap[dumpID]
+				_, err = metadataStmt.Exec(
+					newDumpID, metadata.FilePath, metadata.FileName, metadata.Directory,
+					metadata.SizeBytes, metadata.CreationTimeUTC, metadata.ModificationTimeUTC,
+					metadata.AccessTimeUTC, metadata.FileMode, boolToInt(metadata.IsDirectory),
+					boolToInt(metadata.IsFile), boolToInt(metadata.IsSymlink),
+					boolToInt(metadata.IsHidden), boolToInt(metadata.IsSystem),
+					boolToInt(metadata.IsArchive), boolToInt(metadata.IsReadonly),
+					metadata.FileExtension, metadata.SHA256,
+				)
+				if err != nil {
+					rows.Close()
+					return fmt.Errorf("failed to insert metadata: %v", err)
+				}
+				count++
+			}
+			rows.Close()
+
+			if count < batchSize {
+				break
+			}
+			offset += batchSize
+		}
+	}
+
+	return destTx.Commit()
 }
