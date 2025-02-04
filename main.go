@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -50,12 +52,22 @@ type ProgressStats struct {
 	mutex          sync.Mutex
 }
 
+type AppContext struct {
+	db           *sql.DB
+	tx           *sql.Tx
+	metadataChan chan FileMetadata
+	wg           *sync.WaitGroup
+	stats        *ProgressStats
+	cancel       context.CancelFunc
+	cleanup      sync.Once
+}
+
 const (
-	workerCount      = 4    // 並列処理のワーカー数
-	batchSize        = 100  // SQLiteへの一括挿入サイズ
-	progressInterval = 1    // 進捗表示の間隔（秒）
-	logInterval      = 5    // 詳細ログの出力間隔（秒）
-	filesPerLog      = 1000 // ログを出力するファイル処理数の閾値
+	workerCount      = 4    // Number of parallel workers
+	batchSize        = 100  // Batch size for SQLite inserts
+	progressInterval = 1    // Progress display interval (seconds)
+	logInterval      = 5    // Detailed log output interval (seconds)
+	filesPerLog      = 1000 // Threshold for file processing count before logging
 )
 
 func NewProgressStats() *ProgressStats {
@@ -70,7 +82,7 @@ func (ps *ProgressStats) LogProgress(currentPath string) {
 	atomic.AddInt64(&ps.processedFiles, 1)
 	processedFiles := atomic.LoadInt64(&ps.processedFiles)
 
-	// filesPerLog個ごとにログを出力
+	// Log every filesPerLog files
 	if processedFiles%filesPerLog == 0 {
 		ps.mutex.Lock()
 		now := time.Now()
@@ -79,7 +91,7 @@ func (ps *ProgressStats) LogProgress(currentPath string) {
 		totalFiles := atomic.LoadInt64(&ps.totalFiles)
 		percentComplete := float64(processedFiles) / float64(totalFiles) * 100
 
-		// 現在のディレクトリを取得（長すぎる場合は省略）
+		// Get current directory (truncate if too long)
 		currentDir := filepath.Dir(currentPath)
 		if len(currentDir) > 50 {
 			currentDir = "..." + currentDir[len(currentDir)-47:]
@@ -87,9 +99,207 @@ func (ps *ProgressStats) LogProgress(currentPath string) {
 
 		log.Printf("[Progress] Processed %d/%d files (%.1f%%) at %.1f files/sec - Current dir: %s",
 			processedFiles, totalFiles, percentComplete, filesPerSecond, currentDir)
-		
+
 		ps.lastLogTime = now
 		ps.mutex.Unlock()
+	}
+}
+
+func (app *AppContext) parformCleanup() {
+	app.cleanup.Do(func() {
+		log.Println("Starting graceful shutdown...")
+
+		// Complete processing of pending metadata before closing channel
+		if app.metadataChan != nil {
+			close(app.metadataChan)
+		}
+
+		if app.wg != nil {
+			log.Println("Waiting for pending operations to complete...")
+			app.wg.Wait()
+		}
+
+		// Handle transaction
+		if app.tx != nil {
+			log.Println("Committing final transaction...")
+			if err := app.tx.Commit(); err != nil {
+				log.Printf("Error committing transaction during shutdown: %v", err)
+				if rbErr := app.tx.Rollback(); rbErr != nil {
+					log.Printf("Error rolling back transaction: %v", rbErr)
+				}
+			}
+		}
+
+		// Clean up database connection
+		if app.db != nil {
+			log.Println("Cleaning up database...")
+
+			// Force WAL checkpoint
+			if _, err := app.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+				log.Printf("Error executing WAL checkpoint: %v", err)
+			}
+
+			if err := app.db.Close(); err != nil {
+				log.Printf("Error closing database: %v", err)
+			}
+		}
+
+		log.Println("Graceful shutdown completed")
+	})
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Initialize application context
+	app := &AppContext{
+		wg:     &sync.WaitGroup{},
+		cancel: cancel,
+	}
+	defer app.parformCleanup()
+
+	// Set up signal handling early
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal: %v", sig)
+		cancel() // Cancel context to notify goroutines
+	}()
+
+	storageName, rootDir, dbPath, skipHash := parseFlags()
+
+	// Set up database connection and setup
+	db, err := setupDatabase(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to setup database: %v", err)
+	}
+	app.db = db
+
+	// Manage progress
+	stats := NewProgressStats()
+	app.stats = stats
+
+	// Count files with context awareness
+	if err := countFilesAndSize(rootDir, stats, ctx); err != nil {
+		if err == context.Canceled {
+			log.Println("File counting cancelled by user")
+			return
+		}
+		log.Fatal(err)
+	}
+
+	// Check if we were cancelled during counting
+	if ctx.Err() != nil {
+		return
+	}
+
+	log.Printf("Starting metadata collection from root directory: %s", rootDir)
+
+	// Start transaction
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatalf("Failed to begin transaction: %v", err)
+	}
+	app.tx = tx
+
+	dumpID, err := createDumpEntry(tx, storageName)
+	if err != nil {
+		tx.Rollback()
+		log.Fatal(err)
+	}
+
+	// Metadata processing channel
+	metadataChan := make(chan FileMetadata, workerCount*2)
+	app.metadataChan = metadataChan
+
+	// SQLite insert prepared statement
+	stmt, err := tx.Prepare(`
+		INSERT INTO file_metadata_template (
+			dump_id, file_path, file_name, directory, size_bytes,
+			creation_time_utc, modification_time_utc, access_time_utc,
+			file_mode, is_directory, is_file, is_symlink,
+			is_hidden, is_system, is_archive, is_readonly,
+			file_extension, sha256
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		tx.Rollback()
+		log.Fatalf("Failed to prepare statement: %v", err)
+	}
+	defer stmt.Close()
+
+	// Database write goroutine
+	app.wg.Add(1)
+	go func() {
+		defer app.wg.Done()
+		for metadata := range metadataChan {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				_, err := stmt.Exec(
+					dumpID, metadata.FilePath, metadata.FileName, metadata.Directory,
+					metadata.SizeBytes, metadata.CreationTimeUTC, metadata.ModificationTimeUTC,
+					metadata.AccessTimeUTC, metadata.FileMode, boolToInt(metadata.IsDirectory),
+					boolToInt(metadata.IsFile), boolToInt(metadata.IsSymlink),
+					boolToInt(metadata.IsHidden), boolToInt(metadata.IsSystem),
+					boolToInt(metadata.IsArchive), boolToInt(metadata.IsReadonly),
+					metadata.FileExtension, metadata.SHA256,
+				)
+				if err != nil {
+					log.Printf("Error inserting metadata for %s: %v", metadata.FilePath, err)
+				}
+				atomic.AddInt64(&stats.processedBytes, metadata.SizeBytes)
+			}
+		}
+	}()
+
+	// File system scan
+	err = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		select {
+		case <-ctx.Done():
+			return filepath.SkipAll
+		default:
+			if err != nil {
+				log.Printf("Warning: Error accessing path %s: %v", path, err)
+				return nil
+			}
+
+			relPath, err := filepath.Rel(rootDir, path)
+			if err != nil {
+				log.Printf("Warning: Cannot get relative path for %s: %v", path, err)
+				return nil
+			}
+
+			app.wg.Add(1)
+			go func(path string, info os.FileInfo, relPath string) {
+				defer app.wg.Done()
+				metadata := collectMetadata(path, info, relPath, skipHash)
+				select {
+				case <-ctx.Done():
+					return
+				case metadataChan <- metadata:
+					stats.LogProgress(path)
+				}
+			}(path, info, relPath)
+
+			return nil
+		}
+	})
+
+	if err != nil && err != filepath.SkipAll {
+		app.parformCleanup()
+		log.Fatalf("Failed during file walk: %v", err)
+	}
+
+	app.wg.Wait()
+	close(metadataChan)
+
+	if ctx.Err() == nil {
+		logFinalStatistics(stats)
 	}
 }
 
@@ -107,24 +317,32 @@ func parseFlags() (string, string, string, bool) {
 	return *storageName, *rootDir, *dbPath, *skipHash
 }
 
-func countFilesAndSize(rootDir string, stats *ProgressStats) error {
+func countFilesAndSize(rootDir string, stats *ProgressStats, ctx context.Context) error {
 	log.Println("Counting files and calculating total size...")
 	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+		select {
+		case <-ctx.Done():
+			return filepath.SkipAll
+		default:
+			if err != nil {
+				return nil
+			}
+			atomic.AddInt64(&stats.totalFiles, 1)
+			atomic.AddInt64(&stats.totalBytes, info.Size())
 			return nil
 		}
-		atomic.AddInt64(&stats.totalFiles, 1)
-		atomic.AddInt64(&stats.totalBytes, info.Size())
-		return nil
 	})
-	if err != nil {
+	if err != nil && err != filepath.SkipAll {
 		return fmt.Errorf("failed to count files: %v", err)
 	}
 
-	log.Printf("Found %d files, total size: %.2f GB",
-		stats.totalFiles,
-		float64(stats.totalBytes)/(1024*1024*1024))
-	return nil
+	// Only log the results if we weren't cancelled
+	if ctx.Err() == nil {
+		log.Printf("Found %d files, total size: %.2f GB",
+			stats.totalFiles,
+			float64(stats.totalBytes)/(1024*1024*1024))
+	}
+	return ctx.Err()
 }
 
 func createDumpEntry(tx *sql.Tx, storageName string) (int64, error) {
@@ -143,133 +361,13 @@ func createDumpEntry(tx *sql.Tx, storageName string) (int64, error) {
 	return dumpID, nil
 }
 
-func processFiles(rootDir string, skipHash bool, stats *ProgressStats, metadataChan chan<- FileMetadata, wg *sync.WaitGroup) error {
-	return filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			log.Printf("Warning: Error accessing path %s: %v", path, err)
-			return nil
-		}
-
-		relPath, err := filepath.Rel(rootDir, path)
-		if err != nil {
-			log.Printf("Warning: Cannot get relative path for %s: %v", path, err)
-			return nil
-		}
-
-		wg.Add(1)
-		go func(path string, info os.FileInfo, relPath string) {
-			metadata := collectMetadata(path, info, relPath, skipHash)
-			metadataChan <- metadata
-			stats.LogProgress(path)
-		}(path, info, relPath)
-
-		return nil
-	})
-}
-
-func logFinalStatistics(stats *ProgressStats) {
-	duration := time.Since(stats.startTime)
-	speed := float64(stats.processedFiles) / duration.Seconds()
-	log.Printf("Successfully completed metadata collection in %v", duration)
-	log.Printf("Final statistics:")
-	log.Printf("- Processed %d files", stats.processedFiles)
-	log.Printf("- Total size: %.2f GB", float64(stats.processedBytes)/(1024*1024*1024))
-	log.Printf("- Average speed: %.1f files/sec", speed)
-}
-
-func main() {
-	storageName, rootDir, dbPath, skipHash := parseFlags()
-
-	// データベース接続とセットアップ
-	db, err := setupDatabase(dbPath)
-	if err != nil {
-		log.Fatalf("Failed to setup database: %v", err)
-	}
-	defer db.Close()
-
-	// 進捗状況の管理
-	stats := NewProgressStats()
-	
-	if err := countFilesAndSize(rootDir, stats); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Printf("Starting metadata collection from root directory: %s", rootDir)
-	
-	// トランザクション開始
-	tx, err := db.Begin()
-	if err != nil {
-		log.Fatalf("Failed to begin transaction: %v", err)
-	}
-
-	dumpID, err := createDumpEntry(tx, storageName)
-	if err != nil {
-		tx.Rollback()
-		log.Fatal(err)
-	}
-
-	// メタデータ処理用のチャネル
-	metadataChan := make(chan FileMetadata, workerCount*2)
-	var wg sync.WaitGroup
-
-	// SQLite挿入用のプリペアドステートメント
-	stmt, err := tx.Prepare(`
-		INSERT INTO file_metadata_template (
-			dump_id, file_path, file_name, directory, size_bytes,
-			creation_time_utc, modification_time_utc, access_time_utc,
-			file_mode, is_directory, is_file, is_symlink,
-			is_hidden, is_system, is_archive, is_readonly,
-			file_extension, sha256
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		tx.Rollback()
-		log.Fatalf("Failed to prepare statement: %v", err)
-	}
-	defer stmt.Close()
-
-	// データベース書き込み用ゴルーチン
-	go func() {
-		for metadata := range metadataChan {
-			_, err := stmt.Exec(
-				dumpID, metadata.FilePath, metadata.FileName, metadata.Directory,
-				metadata.SizeBytes, metadata.CreationTimeUTC, metadata.ModificationTimeUTC,
-				metadata.AccessTimeUTC, metadata.FileMode, boolToInt(metadata.IsDirectory),
-				boolToInt(metadata.IsFile), boolToInt(metadata.IsSymlink),
-				boolToInt(metadata.IsHidden), boolToInt(metadata.IsSystem),
-				boolToInt(metadata.IsArchive), boolToInt(metadata.IsReadonly),
-				metadata.FileExtension, metadata.SHA256,
-			)
-			if err != nil {
-				log.Printf("Error inserting metadata for %s: %v", metadata.FilePath, err)
-			}
-			atomic.AddInt64(&stats.processedBytes, metadata.SizeBytes)
-			wg.Done()
-		}
-	}()
-
-	if err := processFiles(rootDir, skipHash, stats, metadataChan, &wg); err != nil {
-		tx.Rollback()
-		log.Fatalf("Failed during file walk: %v", err)
-	}
-
-	wg.Wait()
-	close(metadataChan)
-
-	if err := tx.Commit(); err != nil {
-		log.Fatalf("Failed to commit transaction: %v", err)
-	}
-
-	logFinalStatistics(stats)
-}
-
 func setupDatabase(dbPath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %v", err)
 	}
 
-	// パフォーマンス設定
+	// Performance settings
 	_, err = db.Exec(`
 		PRAGMA journal_mode = WAL;
 		PRAGMA synchronous = NORMAL;
@@ -285,81 +383,81 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 }
 
 func formatFileMode(mode os.FileMode) string {
-    // 基本的なパーミッションビットをマスク
-    permBits := mode & os.ModePerm
-    
-    // ファイルタイプをチェック
-    var typeChar string
-    switch {
-    case mode&os.ModeDir != 0:
-        typeChar = "d"
-    case mode&os.ModeSymlink != 0:
-        typeChar = "l"
-    default:
-        typeChar = "-"
-    }
-    
-    // パーミッションを文字列に変換
-    result := typeChar
-    
-    // オーナーのパーミッション
-    result += map[bool]string{true: "r", false: "-"}[(permBits&0400) != 0]
-    result += map[bool]string{true: "w", false: "-"}[(permBits&0200) != 0]
-    result += map[bool]string{true: "x", false: "-"}[(permBits&0100) != 0]
-    
-    // グループのパーミッション
-    result += map[bool]string{true: "r", false: "-"}[(permBits&040) != 0]
-    result += map[bool]string{true: "w", false: "-"}[(permBits&020) != 0]
-    result += map[bool]string{true: "x", false: "-"}[(permBits&010) != 0]
-    
-    // その他のパーミッション
-    result += map[bool]string{true: "r", false: "-"}[(permBits&04) != 0]
-    result += map[bool]string{true: "w", false: "-"}[(permBits&02) != 0]
-    result += map[bool]string{true: "x", false: "-"}[(permBits&01) != 0]
-    
-    return result
+	// Mask basic permission bits
+	permBits := mode & os.ModePerm
+
+	// Check file type
+	var typeChar string
+	switch {
+	case mode&os.ModeDir != 0:
+		typeChar = "d"
+	case mode&os.ModeSymlink != 0:
+		typeChar = "l"
+	default:
+		typeChar = "-"
+	}
+
+	// Convert permissions to string
+	result := typeChar
+
+	// Owner permissions
+	result += map[bool]string{true: "r", false: "-"}[(permBits&0400) != 0]
+	result += map[bool]string{true: "w", false: "-"}[(permBits&0200) != 0]
+	result += map[bool]string{true: "x", false: "-"}[(permBits&0100) != 0]
+
+	// Group permissions
+	result += map[bool]string{true: "r", false: "-"}[(permBits&040) != 0]
+	result += map[bool]string{true: "w", false: "-"}[(permBits&020) != 0]
+	result += map[bool]string{true: "x", false: "-"}[(permBits&010) != 0]
+
+	// Others permissions
+	result += map[bool]string{true: "r", false: "-"}[(permBits&04) != 0]
+	result += map[bool]string{true: "w", false: "-"}[(permBits&02) != 0]
+	result += map[bool]string{true: "x", false: "-"}[(permBits&01) != 0]
+
+	return result
 }
 
 func collectMetadata(path string, info os.FileInfo, relPath string, skipHash bool) FileMetadata {
-    stat := info.Sys().(*syscall.Stat_t)
-    
-    // macOS固有の属性を取得
-    var isSystem, isArchive bool
-    finderInfo := make([]byte, 32) // FinderInfoは32バイト
-    _, err := unix.Getxattr(path, "com.apple.FinderInfo", finderInfo)
-    if err == nil {
-        // Finder flagsの解析
-        isSystem = finderInfo[8]&uint8(0x04) != 0  // kIsSystemFileBit
-        isArchive = finderInfo[8]&uint8(0x20) != 0 // kIsArchiveBit
-    }
+	stat := info.Sys().(*syscall.Stat_t)
 
-    // SHA256ハッシュの計算（ファイルの場合のみ）
-    var sha256Hash *string
-    if !skipHash && !info.IsDir() {
-        if hash, err := calculateSHA256(path); err == nil {
-            sha256Hash = &hash
-        }
-    }
+	// Get macOS-specific attributes
+	var isSystem, isArchive bool
+	finderInfo := make([]byte, 32) // FinderInfo
+	_, err := unix.Getxattr(path, "com.apple.FinderInfo", finderInfo)
+	if err == nil {
+		// Parse Finder flags
+		isSystem = finderInfo[8]&uint8(0x04) != 0  // kIsSystemFileBit
+		isArchive = finderInfo[8]&uint8(0x20) != 0 // kIsArchiveBit
+	}
 
-    return FileMetadata{
-        FilePath:           relPath,
-        FileName:           info.Name(),
-        Directory:          filepath.Dir(relPath),
-        SizeBytes:          info.Size(),
-        CreationTimeUTC:    stat.Birthtimespec.Sec,
-        ModificationTimeUTC: stat.Mtimespec.Sec,
-        AccessTimeUTC:      stat.Atimespec.Sec,
-        FileMode:           formatFileMode(info.Mode()), // 新しい関数を使用
-        IsDirectory:        info.IsDir(),
-        IsFile:             !info.IsDir(),
-        IsSymlink:          info.Mode()&os.ModeSymlink != 0,
-        IsHidden:           strings.HasPrefix(filepath.Base(path), "."),
-        IsSystem:           isSystem,
-        IsArchive:          isArchive,
-        IsReadonly:         info.Mode()&0200 == 0,
-        FileExtension:      strings.ToLower(filepath.Ext(path)),
-        SHA256:             sha256Hash,
-    }
+	// Calculate SHA256 hash (only for files)
+	var sha256Hash *string
+	if !skipHash && !info.IsDir() {
+		if hash, err := calculateSHA256(path); err == nil {
+			sha256Hash = &hash
+		}
+	}
+
+	return FileMetadata{
+		FilePath:           relPath,
+		FileName:           info.Name(),
+		Directory:          filepath.Dir(relPath),
+		SizeBytes:          info.Size(),
+		CreationTimeUTC:    stat.Birthtimespec.Sec,
+		ModificationTimeUTC: stat.Mtimespec.Sec,
+		AccessTimeUTC:      stat.Atimespec.Sec,
+		FileMode:           formatFileMode(info.Mode()),
+		IsDirectory:        info.IsDir(),
+		IsFile:             !info.IsDir(),
+		IsSymlink:          info.Mode()&os.ModeSymlink != 0,
+		IsHidden:           strings.HasPrefix(filepath.Base(path), "."),
+		IsSystem:           isSystem,
+		IsArchive:          isArchive,
+		IsReadonly:         info.Mode()&0200 == 0,
+		FileExtension:      strings.ToLower(filepath.Ext(path)),
+		SHA256:             sha256Hash,
+	}
 }
 
 func calculateSHA256(path string) (string, error) {
@@ -375,6 +473,16 @@ func calculateSHA256(path string) (string, error) {
 	}
 
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func logFinalStatistics(stats *ProgressStats) {
+	duration := time.Since(stats.startTime)
+	speed := float64(stats.processedFiles) / duration.Seconds()
+	log.Printf("Successfully completed metadata collection in %v", duration)
+	log.Printf("Final statistics:")
+	log.Printf("- Processed %d files", stats.processedFiles)
+	log.Printf("- Total size: %.2f GB", float64(stats.processedBytes)/(1024*1024*1024))
+	log.Printf("- Average speed: %.1f files/sec", speed)
 }
 
 func boolToInt(b bool) int {

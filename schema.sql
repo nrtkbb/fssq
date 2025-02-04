@@ -6,7 +6,7 @@ PRAGMA encoding = 'UTF-8';
 
 -- 1. Core Tables --
 
--- Dumps テーブル：ファイル情報の管理
+-- Dumps table: Manages file information
 CREATE TABLE IF NOT EXISTS dumps (
     dump_id INTEGER PRIMARY KEY AUTOINCREMENT,
     storage_name TEXT NOT NULL UNIQUE,
@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS dumps (
     total_size_bytes INTEGER NOT NULL DEFAULT 0
 );
 
--- ファイルメタデータのテンプレートテーブル
+-- File metadata template table
 CREATE TABLE IF NOT EXISTS file_metadata_template (
     dump_id INTEGER NOT NULL,
     file_path TEXT NOT NULL,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS file_metadata_template (
     CHECK (access_time_utc >= 0)
 ) WITHOUT ROWID;
 
--- パーティション管理テーブル
+-- Partition management table
 CREATE TABLE IF NOT EXISTS partition_registry (
     partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
     dump_id_start INTEGER NOT NULL,
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS partition_registry (
 
 -- 2. Cache Tables --
 
--- ディレクトリ構造キャッシュ
+-- Directory structure cache
 CREATE TABLE IF NOT EXISTS directory_cache (
     dump_id INTEGER NOT NULL,
     directory TEXT NOT NULL,
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS directory_cache (
     CHECK (is_stale IN (0, 1))
 ) WITHOUT ROWID;
 
--- 拡張子統計キャッシュ
+-- File extension statistics cache
 CREATE TABLE IF NOT EXISTS extension_cache (
     dump_id INTEGER NOT NULL,
     file_extension TEXT NOT NULL,
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS extension_cache (
 
 -- 3. Indexes --
 
--- ファイルメタデータのインデックス
+-- File metadata indexes
 CREATE INDEX IF NOT EXISTS idx_file_metadata_file_name 
     ON file_metadata_template(file_name);
 
@@ -124,7 +124,7 @@ CREATE INDEX IF NOT EXISTS idx_file_metadata_sha256
 CREATE INDEX IF NOT EXISTS idx_file_metadata_modification 
     ON file_metadata_template(modification_time_utc);
 
--- キャッシュテーブルのインデックス
+-- Cache table indexes
 CREATE INDEX IF NOT EXISTS idx_directory_cache_parent 
     ON directory_cache(parent_directory);
 
@@ -138,7 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_extension_cache_stale
 
 -- 4. Triggers --
 
--- Dumps統計更新トリガー
+-- Update dumps statistics trigger
 CREATE TRIGGER IF NOT EXISTS update_dumps_stats
 AFTER INSERT ON file_metadata_template
 BEGIN
@@ -151,7 +151,7 @@ BEGIN
     WHERE dump_id = NEW.dump_id;
 END;
 
--- ディレクトリキャッシュ更新トリガー
+-- Mark directory cache as stale trigger
 CREATE TRIGGER IF NOT EXISTS mark_directory_cache_stale
 AFTER INSERT ON file_metadata_template
 BEGIN
@@ -161,7 +161,7 @@ BEGIN
     AND (directory = NEW.directory OR NEW.directory LIKE directory || '/%');
 END;
 
--- 拡張子キャッシュ更新トリガー
+-- Mark extension cache as stale trigger
 CREATE TRIGGER IF NOT EXISTS mark_extension_cache_stale
 AFTER INSERT ON file_metadata_template
 WHEN NEW.is_file = 1
@@ -174,7 +174,7 @@ END;
 
 -- 5. Views --
 
--- キャッシュ状態監視ビュー
+-- Cache status monitoring view
 CREATE VIEW IF NOT EXISTS cache_status AS
 SELECT 
     'directory' as cache_type,
@@ -206,7 +206,7 @@ SELECT
 FROM extension_cache
 GROUP BY dump_id;
 
--- パーティション最適化提案ビュー
+-- Partition optimization suggestion view
 CREATE VIEW IF NOT EXISTS partition_optimization AS
 SELECT 
     pr.table_name,
@@ -232,7 +232,7 @@ SELECT
 FROM partition_registry pr
 WHERE pr.is_active = 1;
 
--- ファイルシステム統計ビュー
+-- Filesystem statistics view
 CREATE VIEW IF NOT EXISTS filesystem_stats AS
 SELECT 
     d.dump_id,
@@ -252,7 +252,7 @@ GROUP BY d.dump_id, d.storage_name;
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
-PRAGMA cache_size = -2000000; -- 約2GB のキャッシュ
-PRAGMA mmap_size = 30000000000; -- 30GB までのメモリマッピング
+PRAGMA cache_size = -2000000; -- Approximately 2GB cache
+PRAGMA mmap_size = 30000000000; -- Memory mapping up to 30GB
 PRAGMA temp_store = MEMORY;
 PRAGMA auto_vacuum = INCREMENTAL;
