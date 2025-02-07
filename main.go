@@ -55,11 +55,13 @@ type ProgressStats struct {
 type AppContext struct {
 	db           *sql.DB
 	tx           *sql.Tx
+	stmt         *sql.Stmt
 	metadataChan chan FileMetadata
 	wg           *sync.WaitGroup
 	stats        *ProgressStats
 	cancel       context.CancelFunc
 	cleanup      sync.Once
+	lastCommit   time.Time
 }
 
 const (
@@ -144,6 +146,11 @@ func (app *AppContext) parformCleanup() {
 			}
 		}
 
+		// Clean up statement
+		if app.stmt != nil {
+			app.stmt.Close()
+		}
+
 		log.Println("Graceful shutdown completed")
 	})
 }
@@ -163,13 +170,30 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	// 強制終了フラグ
+	var forceQuit atomic.Bool
+	
 	go func() {
-		sig := <-sigChan
-		log.Printf("Received signal: %v", sig)
-		cancel() // Cancel context to notify goroutines
+		for sig := range sigChan {
+			log.Printf("Received signal: %v", sig)
+			if forceQuit.Load() {
+				log.Println("強制終了します...")
+				os.Exit(1)
+			}
+			
+			forceQuit.Store(true)
+			log.Println("もう一度Ctrl+Cを押すと強制終了します。通常の終了を待つ場合はお待ちください...")
+			cancel() // Cancel context to notify goroutines
+			
+			// 5秒後にforceQuitフラグをリセット
+			go func() {
+				time.Sleep(5 * time.Second)
+				forceQuit.Store(false)
+			}()
+		}
 	}()
 
-	storageName, rootDir, dbPath, skipHash, mergeSource := parseFlags()
+	storageName, rootDir, dbPath, skipHash, mergeSource, amend := parseFlags()
 
 	// If merge mode is specified, perform merge and exit
 	if mergeSource != "" {
@@ -219,10 +243,55 @@ func main() {
 	}
 	app.tx = tx
 
-	dumpID, err := createDumpEntry(tx, storageName)
-	if err != nil {
-		tx.Rollback()
-		log.Fatal(err)
+	// 既存のdump_idを取得（amend モード用）
+	var dumpID int64
+	if amend {
+		err = db.QueryRow(`
+			SELECT dump_id FROM dumps 
+			WHERE storage_name = ? 
+			ORDER BY created_at DESC 
+			LIMIT 1
+		`, storageName).Scan(&dumpID)
+		if err == sql.ErrNoRows {
+			log.Printf("警告: 指定されたストレージ名 %s の以前のダンプが見つかりません。新規作成します。", storageName)
+			amend = false
+		} else if err != nil {
+			log.Fatalf("以前のダンプの検索中にエラーが発生: %v", err)
+		} else {
+			log.Printf("dump_id %d の処理を再開します", dumpID)
+		}
+	}
+
+	// 新規ダンプの作成（amend モードでない場合）
+	if !amend {
+		dumpID, err = createDumpEntry(tx, storageName)
+		if err != nil {
+			tx.Rollback()
+			log.Fatal(err)
+		}
+	}
+
+	// 処理済みのファイルパスを取得（amend モード用）
+	processedPaths := make(map[string]struct{})
+	if amend {
+		rows, err := db.Query(`
+			SELECT file_path 
+			FROM file_metadata_template 
+			WHERE dump_id = ?
+		`, dumpID)
+		if err != nil {
+			log.Fatalf("処理済みファイルの取得中にエラー: %v", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				log.Fatalf("処理済みファイルの読み取り中にエラー: %v", err)
+			}
+			processedPaths[path] = struct{}{}
+		}
+		log.Printf("%d 個の処理済みファイルをスキップします", len(processedPaths))
 	}
 
 	// Metadata processing channel
@@ -249,12 +318,24 @@ func main() {
 	app.wg.Add(1)
 	go func() {
 		defer app.wg.Done()
+		
+		// 初期トランザクションのセットアップ
+		if err := app.refreshTransaction(); err != nil {
+			log.Printf("初期トランザクションのセットアップに失敗: %v", err)
+			app.cancel()
+			return
+		}
+
+		const commitInterval = 30 * time.Second // 30秒ごとにコミット
+		processedSinceCommit := 0
+		const commitThreshold = 10000          // または10000レコードごとにコミット
+
 		for metadata := range metadataChan {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				_, err := stmt.Exec(
+				_, err := app.stmt.Exec(
 					dumpID, metadata.FilePath, metadata.FileName, metadata.Directory,
 					metadata.SizeBytes, metadata.CreationTimeUTC, metadata.ModificationTimeUTC,
 					metadata.AccessTimeUTC, metadata.FileMode, boolToInt(metadata.IsDirectory),
@@ -264,14 +345,36 @@ func main() {
 					metadata.FileExtension, metadata.SHA256,
 				)
 				if err != nil {
-					log.Printf("Error inserting metadata for %s: %v", metadata.FilePath, err)
+					log.Printf("メタデータの挿入エラー %s: %v", metadata.FilePath, err)
 				}
 				atomic.AddInt64(&stats.processedBytes, metadata.SizeBytes)
+				
+				processedSinceCommit++
+
+				// 一定時間経過またはレコード数の閾値を超えた場合にコミット
+				if time.Since(app.lastCommit) >= commitInterval || processedSinceCommit >= commitThreshold {
+					if err := app.refreshTransaction(); err != nil {
+						log.Printf("トランザクションの更新に失敗: %v", err)
+						app.cancel()
+						return
+					}
+					log.Printf("トランザクションをコミットしました（%d レコード処理済み）", processedSinceCommit)
+					processedSinceCommit = 0
+				}
+			}
+		}
+
+		// 最終的な未コミットのデータをコミット
+		if processedSinceCommit > 0 {
+			if err := app.refreshTransaction(); err != nil {
+				log.Printf("最終トランザクションのコミットに失敗: %v", err)
 			}
 		}
 	}()
 
 	// File system scan
+	semaphore := make(chan struct{}, workerCount)
+	
 	err = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 		select {
 		case <-ctx.Done():
@@ -288,9 +391,18 @@ func main() {
 				return nil
 			}
 
+			// amend モードの場合、既に処理済みのパスをスキップ
+			if amend {
+				if _, exists := processedPaths[relPath]; exists {
+					return nil
+				}
+			}
+
+			semaphore <- struct{}{} // セマフォを獲得
 			app.wg.Add(1)
 			go func(path string, info os.FileInfo, relPath string) {
 				defer app.wg.Done()
+				defer func() { <-semaphore }() // セマフォを解放
 				metadata := collectMetadata(path, info, relPath, skipHash)
 				select {
 				case <-ctx.Done():
@@ -303,6 +415,11 @@ func main() {
 			return nil
 		}
 	})
+
+	// ここでセマフォチャネルを空にする処理を追加
+	for i := 0; i < workerCount; i++ {
+		semaphore <- struct{}{}
+	}
 
 	if err != nil && err != filepath.SkipAll {
 		app.parformCleanup()
@@ -317,12 +434,13 @@ func main() {
 	}
 }
 
-func parseFlags() (string, string, string, bool, string) {
+func parseFlags() (string, string, string, bool, string, bool) {
 	storageName := flag.String("storage", "", "Storage name identifier")
 	rootDir := flag.String("root", "", "Root directory to scan")
 	dbPath := flag.String("db", "", "SQLite database path")
 	skipHash := flag.Bool("skip-hash", false, "Skip SHA256 hash calculation")
 	mergeSource := flag.String("merge", "", "Source database to merge from")
+	amend := flag.Bool("amend", false, "Continue from last incomplete dump")
 	flag.Parse()
 
 	// Validate normal mode
@@ -330,7 +448,7 @@ func parseFlags() (string, string, string, bool, string) {
 		if *storageName == "" || *rootDir == "" || *dbPath == "" {
 			log.Fatal("All arguments are required: -storage, -root, -db")
 		}
-		return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource
+		return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource, *amend
 	}
 
 	// Validate merge mode
@@ -341,7 +459,7 @@ func parseFlags() (string, string, string, bool, string) {
 		log.Fatal("Source and destination databases must be different")
 	}
 
-	return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource
+	return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource, *amend
 }
 
 func countFilesAndSize(rootDir string, stats *ProgressStats, ctx context.Context) error {
@@ -704,5 +822,43 @@ func mergeDatabase(ctx context.Context, sourceDB, destDB string) error {
 		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
+	return nil
+}
+
+func (app *AppContext) refreshTransaction() error {
+	if app.tx != nil {
+		// 既存のステートメントをクローズ
+		if app.stmt != nil {
+			app.stmt.Close()
+		}
+		
+		// 現在のトランザクションをコミット
+		if err := app.tx.Commit(); err != nil {
+			return fmt.Errorf("トランザクションのコミットに失敗: %v", err)
+		}
+	}
+
+	// 新しいトランザクションを開始
+	var err error
+	app.tx, err = app.db.Begin()
+	if err != nil {
+		return fmt.Errorf("新しいトランザクションの開始に失敗: %v", err)
+	}
+
+	// 新しいPrepared Statementを作成
+	app.stmt, err = app.tx.Prepare(`
+		INSERT INTO file_metadata_template (
+			dump_id, file_path, file_name, directory, size_bytes,
+			creation_time_utc, modification_time_utc, access_time_utc,
+			file_mode, is_directory, is_file, is_symlink,
+			is_hidden, is_system, is_archive, is_readonly,
+			file_extension, sha256
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("ステートメントの準備に失敗: %v", err)
+	}
+
+	app.lastCommit = time.Now()
 	return nil
 }
