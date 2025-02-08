@@ -62,6 +62,7 @@ type AppContext struct {
 	cancel       context.CancelFunc
 	cleanup      sync.Once
 	lastCommit   time.Time
+	channelClosed bool
 }
 
 const (
@@ -109,15 +110,15 @@ func (ps *ProgressStats) LogProgress(currentPath string) {
 
 func (app *AppContext) parformCleanup() {
 	app.cleanup.Do(func() {
-		log.Println("Starting graceful shutdown...")
+		log.Println("シャットダウンを開始します...")
 
-		// Complete processing of pending metadata before closing channel
-		if app.metadataChan != nil {
+		if app.metadataChan != nil && !app.channelClosed {
 			close(app.metadataChan)
+			app.channelClosed = true
 		}
 
 		if app.wg != nil {
-			log.Println("Waiting for pending operations to complete...")
+			log.Println("保留中の操作の完了を待機中...")
 			app.wg.Wait()
 		}
 
@@ -327,7 +328,7 @@ func main() {
 	}
 
 	// Metadata processing channel
-	metadataChan := make(chan FileMetadata, workerCount*2)
+	metadataChan := make(chan FileMetadata, workerCount*10)
 	app.metadataChan = metadataChan
 
 	// SQLite insert prepared statement
@@ -409,7 +410,10 @@ func main() {
 	scanComplete := make(chan struct{}) // Channel to notify scan completion
 	
 	// Execute filesystem scan in a separate goroutine
+	var scanWg sync.WaitGroup
+	scanWg.Add(1)
 	go func() {
+		defer scanWg.Done()
 		err = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 			select {
 			case <-ctx.Done():
@@ -431,12 +435,14 @@ func main() {
 					if _, exists := processedPaths[relPath]; exists {
 						return nil
 					}
+					// 新しいファイルを見つけた時のログ
+					log.Printf("新規ファイルを処理: %s", relPath)
 				}
 
 				semaphore <- struct{}{} // Acquire semaphore
-				app.wg.Add(1)
+				scanWg.Add(1)
 				go func(path string, info os.FileInfo, relPath string) {
-					defer app.wg.Done()
+					defer scanWg.Done()
 					defer func() { <-semaphore }() // Release semaphore
 					metadata := collectMetadata(path, info, relPath, skipHash)
 					select {
@@ -467,13 +473,7 @@ func main() {
 
 	// Wait for scan completion and all workers to finish
 	<-scanComplete
-	app.wg.Wait()
-
-	// Close metadata channel
-	close(metadataChan)
-
-	// Wait for database worker to complete
-	app.wg.Wait()
+	scanWg.Wait()
 
 	if err != nil && err != filepath.SkipAll {
 		app.parformCleanup()
@@ -483,6 +483,15 @@ func main() {
 	if ctx.Err() == nil {
 		logFinalStatistics(stats)
 	}
+
+	// メタデータチャネルを閉じて、データベースワーカーに終了を通知
+	if !app.channelClosed {
+		close(app.metadataChan)
+		app.channelClosed = true
+	}
+
+	// データベースワーカーの完了を待機
+	app.wg.Wait()
 }
 
 func parseFlags() (string, string, string, bool, string, bool) {
