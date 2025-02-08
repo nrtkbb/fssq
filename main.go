@@ -406,60 +406,79 @@ func main() {
 
 	// File system scan
 	semaphore := make(chan struct{}, workerCount)
+	scanComplete := make(chan struct{}) // 追加：スキャン完了を通知するチャネル
 	
-	err = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		select {
-		case <-ctx.Done():
-			return filepath.SkipAll
-		default:
-			if err != nil {
-				log.Printf("Warning: Error accessing path %s: %v", path, err)
-				return nil
-			}
-
-			relPath, err := filepath.Rel(rootDir, path)
-			if err != nil {
-				log.Printf("Warning: Cannot get relative path for %s: %v", path, err)
-				return nil
-			}
-
-			// amend モードの場合、既に処理済みのパスをスキップ
-			if amend {
-				if _, exists := processedPaths[relPath]; exists {
+	// ファイルシステムスキャンを別のゴルーチンで実行
+	go func() {
+		err = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+			select {
+			case <-ctx.Done():
+				return filepath.SkipAll
+			default:
+				if err != nil {
+					log.Printf("Warning: Error accessing path %s: %v", path, err)
 					return nil
 				}
-			}
 
-			semaphore <- struct{}{} // セマフォを獲得
-			app.wg.Add(1)
-			go func(path string, info os.FileInfo, relPath string) {
-				defer app.wg.Done()
-				defer func() { <-semaphore }() // セマフォを解放
-				metadata := collectMetadata(path, info, relPath, skipHash)
-				select {
-				case <-ctx.Done():
-					return
-				case metadataChan <- metadata:
-					stats.LogProgress(path)
+				relPath, err := filepath.Rel(rootDir, path)
+				if err != nil {
+					log.Printf("Warning: Cannot get relative path for %s: %v", path, err)
+					return nil
 				}
-			}(path, info, relPath)
 
-			return nil
+				// amend モードの場合、既に処理済みのパスをスキップ
+				if amend {
+					if _, exists := processedPaths[relPath]; exists {
+						return nil
+					}
+				}
+
+				semaphore <- struct{}{} // セマフォを獲得
+				app.wg.Add(1)
+				go func(path string, info os.FileInfo, relPath string) {
+					defer app.wg.Done()
+					defer func() { <-semaphore }() // セマフォを解放
+					metadata := collectMetadata(path, info, relPath, skipHash)
+					select {
+					case <-ctx.Done():
+						return
+					case metadataChan <- metadata:
+						stats.LogProgress(path)
+					}
+				}(path, info, relPath)
+
+				return nil
+			}
+		})
+
+		// スキャン完了後の処理
+		close(scanComplete) // スキャン完了を通知
+
+		// セマフォを空にする
+		for i := 0; i < workerCount; i++ {
+			semaphore <- struct{}{}
 		}
-	})
 
-	// ここでセマフォチャネルを空にする処理を追加
-	for i := 0; i < workerCount; i++ {
-		semaphore <- struct{}{}
-	}
+		if err != nil && err != filepath.SkipAll {
+			log.Printf("Error during file walk: %v", err)
+			app.cancel()
+		}
+	}()
+
+	// スキャン完了とすべてのワーカーの終了を待つ
+	<-scanComplete
+	app.wg.Wait()
+
+	// メタデータチャネルを閉じる
+	close(metadataChan)
+
+	// データベースワーカーの完了を待つ
+	app.wg.Wait()
 
 	if err != nil && err != filepath.SkipAll {
 		app.parformCleanup()
 		log.Fatalf("Failed during file walk: %v", err)
 	}
-
-	app.wg.Wait()
-	close(metadataChan)
 
 	if ctx.Err() == nil {
 		logFinalStatistics(stats)
