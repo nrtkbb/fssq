@@ -45,7 +45,6 @@ type FileMetadata struct {
 type ProgressStats struct {
 	totalFiles     int64
 	processedFiles int64
-	totalBytes     int64
 	processedBytes int64
 	startTime      time.Time
 	lastLogTime    time.Time
@@ -238,15 +237,6 @@ func main() {
 	stats := NewProgressStats()
 	app.stats = stats
 
-	// Count files with context awareness
-	if err := countFilesAndSize(rootDir, stats, ctx); err != nil {
-		if err == context.Canceled {
-			log.Println("File counting cancelled by user")
-			return
-		}
-		log.Fatal(err)
-	}
-
 	// Check if we were cancelled during counting
 	if ctx.Err() != nil {
 		return
@@ -254,60 +244,53 @@ func main() {
 
 	log.Printf("Starting metadata collection from root directory: %s", rootDir)
 
-	// Start transaction
-	tx, err := db.Begin()
-	if err != nil {
-		log.Fatalf("Failed to begin transaction: %v", err)
-	}
-	app.tx = tx
-
-	// Check transaction state for amend mode
-	if amend {
-		var inTransaction int
-		err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master LIMIT 1").Scan(&inTransaction)
-		if err != nil {
-			log.Fatalf("Failed to check database state: %v", err)
-		}
-		
-		// Execute explicit rollback for safety
-		if _, err := db.Exec("ROLLBACK"); err != nil {
-			log.Printf("Warning: Error during rollback: %v", err)
-		}
-		log.Println("Database state has been reset")
-	}
-
-	// Get existing dump_id (for amend mode)
+	// Create new dump entry (if not in amend mode)
 	var dumpID int64
 	if amend {
-		err = db.QueryRow(`
+		// Start new transaction for amend mode
+		tx, err := db.Begin()
+		if err != nil {
+			log.Fatalf("Failed to begin transaction: %v", err)
+		}
+		
+		// Get existing dump_id
+		err = tx.QueryRow(`
 			SELECT dump_id FROM dumps 
 			WHERE storage_name = ? 
 			ORDER BY created_at DESC 
 			LIMIT 1
 		`, storageName).Scan(&dumpID)
 		if err == sql.ErrNoRows {
+			tx.Rollback() // ロールバックしてから新規作成モードへ
 			log.Printf("Warning: No previous dump found for storage name %s. Creating new.", storageName)
 			amend = false
 		} else if err != nil {
+			tx.Rollback()
 			log.Fatalf("Error searching for previous dump: %v", err)
 		} else {
+			app.tx = tx // エラーがない場合のみapp.txに設定
 			log.Printf("Resuming processing for dump_id %d", dumpID)
 		}
 	}
 
-	// Create new dump entry (if not in amend mode)
 	if !amend {
+		tx, err := db.Begin()
+		if err != nil {
+			log.Fatalf("Failed to begin transaction: %v", err)
+		}
+		
 		dumpID, err = createDumpEntry(tx, storageName)
 		if err != nil {
 			tx.Rollback()
 			log.Fatal(err)
 		}
+		app.tx = tx // エラーがない場合のみapp.txに設定
 	}
 
 	// Get processed file paths (for amend mode)
 	processedPaths := make(map[string]struct{})
 	if amend {
-		rows, err := db.Query(`
+		rows, err := app.tx.Query(`
 			SELECT file_path 
 			FROM file_metadata_template 
 			WHERE dump_id = ?
@@ -330,22 +313,6 @@ func main() {
 	// Metadata processing channel
 	metadataChan := make(chan FileMetadata, workerCount*10)
 	app.metadataChan = metadataChan
-
-	// SQLite insert prepared statement
-	stmt, err := tx.Prepare(`
-		INSERT INTO file_metadata_template (
-			dump_id, file_path, file_name, directory, size_bytes,
-			creation_time_utc, modification_time_utc, access_time_utc,
-			file_mode, is_directory, is_file, is_symlink,
-			is_hidden, is_system, is_archive, is_readonly,
-			file_extension, sha256
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		tx.Rollback()
-		log.Fatalf("Failed to prepare statement: %v", err)
-	}
-	defer stmt.Close()
 
 	// Database write goroutine
 	app.wg.Add(1)
@@ -407,11 +374,8 @@ func main() {
 
 	var newFilesFound int64 // Track count of new files
 	const logInterval = 1000 // Log every 1000 new files
-
-	// File system scan
-	semaphore := make(chan struct{}, workerCount)
+	// Modify metadata collection part
 	scanComplete := make(chan struct{})
-	
 	var scanWg sync.WaitGroup
 	scanWg.Add(1)
 	go func() {
@@ -443,19 +407,14 @@ func main() {
 					}
 				}
 
-				semaphore <- struct{}{} // Acquire semaphore
-				scanWg.Add(1)
-				go func(path string, info os.FileInfo, relPath string) {
-					defer scanWg.Done()
-					defer func() { <-semaphore }() // Release semaphore
-					metadata := collectMetadata(path, info, relPath, skipHash)
-					select {
-					case <-ctx.Done():
-						return
-					case metadataChan <- metadata:
-						stats.LogProgress(path)
-					}
-				}(path, info, relPath)
+				// Process sequentially
+				metadata := collectMetadata(path, info, relPath, skipHash)
+				select {
+				case <-ctx.Done():
+					return filepath.SkipAll
+				case metadataChan <- metadata:
+					stats.LogProgress(path)
+				}
 
 				return nil
 			}
@@ -471,17 +430,12 @@ func main() {
 			}
 		}
 
-		// Empty the semaphore
-		for i := 0; i < workerCount; i++ {
-			semaphore <- struct{}{}
-		}
-
 		if err != nil && err != filepath.SkipAll {
 			log.Printf("Error during file walk: %v", err)
 			app.cancel()
 		}
 
-		close(scanComplete) // Notify scan completion
+		close(scanComplete)
 	}()
 
 	// Wait for scan completion and all workers to finish
@@ -496,14 +450,13 @@ func main() {
 	if ctx.Err() == nil {
 		logFinalStatistics(stats)
 	}
-
-	// メタデータチャネルを閉じて、データベースワーカーに終了を通知
+	// Close metadata channel to signal database worker to finish
 	if !app.channelClosed {
 		close(app.metadataChan)
 		app.channelClosed = true
 	}
 
-	// データベースワーカーの完了を待機
+	// Wait for database worker to complete
 	app.wg.Wait()
 }
 
@@ -533,34 +486,6 @@ func parseFlags() (string, string, string, bool, string, bool) {
 	}
 
 	return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource, *amend
-}
-
-func countFilesAndSize(rootDir string, stats *ProgressStats, ctx context.Context) error {
-	log.Println("Counting files and calculating total size...")
-	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		select {
-		case <-ctx.Done():
-			return filepath.SkipAll
-		default:
-			if err != nil {
-				return nil
-			}
-			atomic.AddInt64(&stats.totalFiles, 1)
-			atomic.AddInt64(&stats.totalBytes, info.Size())
-			return nil
-		}
-	})
-	if err != nil && err != filepath.SkipAll {
-		return fmt.Errorf("failed to count files: %v", err)
-	}
-
-	// Only log the results if we weren't cancelled
-	if ctx.Err() == nil {
-		log.Printf("Found %d files, total size: %.2f GB",
-			stats.totalFiles,
-			float64(stats.totalBytes)/(1024*1024*1024))
-	}
-	return ctx.Err()
 }
 
 func createDumpEntry(tx *sql.Tx, storageName string) (int64, error) {
@@ -925,11 +850,17 @@ func (app *AppContext) refreshTransaction() error {
 	if app.tx != nil {
 		// Close existing statement
 		if app.stmt != nil {
-			app.stmt.Close()
+			if err := app.stmt.Close(); err != nil {
+				log.Printf("Warning: Failed to close statement: %v", err)
+			}
+			app.stmt = nil
 		}
 		
 		// Commit current transaction
 		if err := app.tx.Commit(); err != nil {
+			if rbErr := app.tx.Rollback(); rbErr != nil {
+				return fmt.Errorf("failed to rollback after commit error: %v (original error: %v)", rbErr, err)
+			}
 			return fmt.Errorf("failed to commit transaction: %v", err)
 		}
 	}
@@ -952,6 +883,9 @@ func (app *AppContext) refreshTransaction() error {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
+		if rbErr := app.tx.Rollback(); rbErr != nil {
+			return fmt.Errorf("failed to rollback after prepare statement error: %v (original error: %v)", rbErr, err)
+		}
 		return fmt.Errorf("failed to prepare statement: %v", err)
 	}
 
