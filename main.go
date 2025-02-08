@@ -145,20 +145,20 @@ func (app *AppContext) parformCleanup() {
 				log.Printf("Error closing database: %v", err)
 			}
 
-			// WALファイルとSHMファイルの存在確認とクリーンアップ
+			// Check for and clean up WAL and SHM files
 			var dbPath string
 			err := app.db.QueryRow("PRAGMA database_list").Scan(nil, &dbPath, nil)
 			if err != nil {
-				log.Printf("Warning: データベースパスの取得に失敗: %v", err)
+				log.Printf("Warning: Failed to get database path: %v", err)
 			} else {
 				walPath := dbPath + "-wal"
 				shmPath := dbPath + "-shm"
 				
 				if _, err := os.Stat(walPath); err == nil {
-					log.Printf("WALファイルが残存しています: %s", walPath)
+					log.Printf("WAL file still exists: %s", walPath)
 				}
 				if _, err := os.Stat(shmPath); err == nil {
-					log.Printf("SHMファイルが残存しています: %s", shmPath)
+					log.Printf("SHM file still exists: %s", shmPath)
 				}
 			}
 		}
@@ -187,22 +187,22 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// 強制終了フラグ
+	// Force quit flag
 	var forceQuit atomic.Bool
 	
 	go func() {
 		for sig := range sigChan {
 			log.Printf("Received signal: %v", sig)
 			if forceQuit.Load() {
-				log.Println("強制終了します...")
+				log.Println("Forcing immediate shutdown...")
 				os.Exit(1)
 			}
 			
 			forceQuit.Store(true)
-			log.Println("もう一度Ctrl+Cを押すと強制終了します。通常の終了を待つ場合はお待ちください...")
+			log.Println("Press Ctrl+C again to force quit. Wait for normal shutdown to complete...")
 			cancel() // Cancel context to notify goroutines
 			
-			// 5秒後にforceQuitフラグをリセット
+			// Reset forceQuit flag after 5 seconds
 			go func() {
 				time.Sleep(5 * time.Second)
 				forceQuit.Store(false)
@@ -260,22 +260,22 @@ func main() {
 	}
 	app.tx = tx
 
-	// amend モードの場合、トランザクションの状態を確認
+	// Check transaction state for amend mode
 	if amend {
 		var inTransaction int
 		err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master LIMIT 1").Scan(&inTransaction)
 		if err != nil {
-			log.Fatalf("データベースの状態確認に失敗: %v", err)
+			log.Fatalf("Failed to check database state: %v", err)
 		}
 		
-		// 安全のため、明示的にロールバックを実行
+		// Execute explicit rollback for safety
 		if _, err := db.Exec("ROLLBACK"); err != nil {
-			log.Printf("警告: ロールバックの実行中にエラー: %v", err)
+			log.Printf("Warning: Error during rollback: %v", err)
 		}
-		log.Println("データベースの状態をリセットしました")
+		log.Println("Database state has been reset")
 	}
 
-	// 既存のdump_idを取得（amend モード用）
+	// Get existing dump_id (for amend mode)
 	var dumpID int64
 	if amend {
 		err = db.QueryRow(`
@@ -285,16 +285,16 @@ func main() {
 			LIMIT 1
 		`, storageName).Scan(&dumpID)
 		if err == sql.ErrNoRows {
-			log.Printf("警告: 指定されたストレージ名 %s の以前のダンプが見つかりません。新規作成します。", storageName)
+			log.Printf("Warning: No previous dump found for storage name %s. Creating new.", storageName)
 			amend = false
 		} else if err != nil {
-			log.Fatalf("以前のダンプの検索中にエラーが発生: %v", err)
+			log.Fatalf("Error searching for previous dump: %v", err)
 		} else {
-			log.Printf("dump_id %d の処理を再開します", dumpID)
+			log.Printf("Resuming processing for dump_id %d", dumpID)
 		}
 	}
 
-	// 新規ダンプの作成（amend モードでない場合）
+	// Create new dump entry (if not in amend mode)
 	if !amend {
 		dumpID, err = createDumpEntry(tx, storageName)
 		if err != nil {
@@ -303,7 +303,7 @@ func main() {
 		}
 	}
 
-	// 処理済みのファイルパスを取得（amend モード用）
+	// Get processed file paths (for amend mode)
 	processedPaths := make(map[string]struct{})
 	if amend {
 		rows, err := db.Query(`
@@ -312,18 +312,18 @@ func main() {
 			WHERE dump_id = ?
 		`, dumpID)
 		if err != nil {
-			log.Fatalf("処理済みファイルの取得中にエラー: %v", err)
+			log.Fatalf("Error retrieving processed files: %v", err)
 		}
 		defer rows.Close()
 
 		for rows.Next() {
 			var path string
 			if err := rows.Scan(&path); err != nil {
-				log.Fatalf("処理済みファイルの読み取り中にエラー: %v", err)
+				log.Fatalf("Error reading processed file: %v", err)
 			}
 			processedPaths[path] = struct{}{}
 		}
-		log.Printf("%d 個の処理済みファイルをスキップします", len(processedPaths))
+		log.Printf("Will skip %d previously processed files", len(processedPaths))
 	}
 
 	// Metadata processing channel
@@ -351,16 +351,16 @@ func main() {
 	go func() {
 		defer app.wg.Done()
 		
-		// 初期トランザクションのセットアップ
+		// Initial transaction setup
 		if err := app.refreshTransaction(); err != nil {
-			log.Printf("初期トランザクションのセットアップに失敗: %v", err)
+			log.Printf("Failed to setup initial transaction: %v", err)
 			app.cancel()
 			return
 		}
 
-		const commitInterval = 30 * time.Second // 30秒ごとにコミット
+		const commitInterval = 30 * time.Second // Commit every 30 seconds
 		processedSinceCommit := 0
-		const commitThreshold = 10000          // または10000レコードごとにコミット
+		const commitThreshold = 10000          // Or commit every 10000 records
 
 		for metadata := range metadataChan {
 			select {
@@ -377,38 +377,38 @@ func main() {
 					metadata.FileExtension, metadata.SHA256,
 				)
 				if err != nil {
-					log.Printf("メタデータの挿入エラー %s: %v", metadata.FilePath, err)
+					log.Printf("Error inserting metadata for %s: %v", metadata.FilePath, err)
 				}
 				atomic.AddInt64(&stats.processedBytes, metadata.SizeBytes)
 				
 				processedSinceCommit++
 
-				// 一定時間経過またはレコード数の閾値を超えた場合にコミット
+				// Commit when time interval elapsed or record threshold reached
 				if time.Since(app.lastCommit) >= commitInterval || processedSinceCommit >= commitThreshold {
 					if err := app.refreshTransaction(); err != nil {
-						log.Printf("トランザクションの更新に失敗: %v", err)
+						log.Printf("Failed to refresh transaction: %v", err)
 						app.cancel()
 						return
 					}
-					log.Printf("トランザクションをコミットしました（%d レコード処理済み）", processedSinceCommit)
+					log.Printf("Transaction committed (%d records processed)", processedSinceCommit)
 					processedSinceCommit = 0
 				}
 			}
 		}
 
-		// 最終的な未コミットのデータをコミット
+		// Commit any remaining uncommitted data
 		if processedSinceCommit > 0 {
 			if err := app.refreshTransaction(); err != nil {
-				log.Printf("最終トランザクションのコミットに失敗: %v", err)
+				log.Printf("Failed to commit final transaction: %v", err)
 			}
 		}
 	}()
 
 	// File system scan
 	semaphore := make(chan struct{}, workerCount)
-	scanComplete := make(chan struct{}) // 追加：スキャン完了を通知するチャネル
+	scanComplete := make(chan struct{}) // Channel to notify scan completion
 	
-	// ファイルシステムスキャンを別のゴルーチンで実行
+	// Execute filesystem scan in a separate goroutine
 	go func() {
 		err = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 			select {
@@ -426,18 +426,18 @@ func main() {
 					return nil
 				}
 
-				// amend モードの場合、既に処理済みのパスをスキップ
+				// Skip already processed paths in amend mode
 				if amend {
 					if _, exists := processedPaths[relPath]; exists {
 						return nil
 					}
 				}
 
-				semaphore <- struct{}{} // セマフォを獲得
+				semaphore <- struct{}{} // Acquire semaphore
 				app.wg.Add(1)
 				go func(path string, info os.FileInfo, relPath string) {
 					defer app.wg.Done()
-					defer func() { <-semaphore }() // セマフォを解放
+					defer func() { <-semaphore }() // Release semaphore
 					metadata := collectMetadata(path, info, relPath, skipHash)
 					select {
 					case <-ctx.Done():
@@ -451,10 +451,10 @@ func main() {
 			}
 		})
 
-		// スキャン完了後の処理
-		close(scanComplete) // スキャン完了を通知
+		// Post-scan processing
+		close(scanComplete) // Notify scan completion
 
-		// セマフォを空にする
+		// Empty the semaphore
 		for i := 0; i < workerCount; i++ {
 			semaphore <- struct{}{}
 		}
@@ -465,14 +465,14 @@ func main() {
 		}
 	}()
 
-	// スキャン完了とすべてのワーカーの終了を待つ
+	// Wait for scan completion and all workers to finish
 	<-scanComplete
 	app.wg.Wait()
 
-	// メタデータチャネルを閉じる
+	// Close metadata channel
 	close(metadataChan)
 
-	// データベースワーカーの完了を待つ
+	// Wait for database worker to complete
 	app.wg.Wait()
 
 	if err != nil && err != filepath.SkipAll {
@@ -558,9 +558,9 @@ func createDumpEntry(tx *sql.Tx, storageName string) (int64, error) {
 }
 
 func setupDatabase(dbPath string) (*sql.DB, error) {
-	// データベースを開く前にWALのリカバリを確認
+	// Check for WAL recovery before opening database
 	if _, err := os.Stat(dbPath + "-wal"); err == nil {
-		log.Println("WALファイルが見つかりました。リカバリを実行します...")
+		log.Println("Found WAL file. Executing recovery...")
 	}
 
 	db, err := sql.Open("sqlite3", dbPath)
@@ -568,11 +568,11 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open database: %v", err)
 	}
 
-	// WALモード設定の前にチェックポイントを実行
+	// Execute checkpoint before setting WAL mode
 	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		log.Printf("Warning: WALチェックポイントの実行に失敗: %v", err)
+		log.Printf("Warning: Failed to execute WAL checkpoint: %v", err)
 	} else {
-		log.Println("WALチェックポイントが正常に実行されました")
+		log.Println("WAL checkpoint executed successfully")
 	}
 
 	// Performance settings
@@ -588,14 +588,14 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to set database pragmas: %v", err)
 	}
 
-	// データベースの整合性チェック
+	// Check database integrity
 	var integrityCheck string
 	err = db.QueryRow("PRAGMA quick_check").Scan(&integrityCheck)
 	if err != nil {
-		return nil, fmt.Errorf("データベースの整合性チェックに失敗: %v", err)
+		return nil, fmt.Errorf("failed to check database integrity: %v", err)
 	}
 	if integrityCheck != "ok" {
-		return nil, fmt.Errorf("データベースの整合性に問題があります: %s", integrityCheck)
+		return nil, fmt.Errorf("database integrity check failed: %s", integrityCheck)
 	}
 
 	return db, nil
@@ -901,25 +901,25 @@ func mergeDatabase(ctx context.Context, sourceDB, destDB string) error {
 
 func (app *AppContext) refreshTransaction() error {
 	if app.tx != nil {
-		// 既存のステートメントをクローズ
+		// Close existing statement
 		if app.stmt != nil {
 			app.stmt.Close()
 		}
 		
-		// 現在のトランザクションをコミット
+		// Commit current transaction
 		if err := app.tx.Commit(); err != nil {
-			return fmt.Errorf("トランザクションのコミットに失敗: %v", err)
+			return fmt.Errorf("failed to commit transaction: %v", err)
 		}
 	}
 
-	// 新しいトランザクションを開始
+	// Start new transaction
 	var err error
 	app.tx, err = app.db.Begin()
 	if err != nil {
-		return fmt.Errorf("新しいトランザクションの開始に失敗: %v", err)
+		return fmt.Errorf("failed to start new transaction: %v", err)
 	}
 
-	// 新しいPrepared Statementを作成
+	// Create new prepared statement
 	app.stmt, err = app.tx.Prepare(`
 		INSERT INTO file_metadata_template (
 			dump_id, file_path, file_name, directory, size_bytes,
@@ -930,7 +930,7 @@ func (app *AppContext) refreshTransaction() error {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
-		return fmt.Errorf("ステートメントの準備に失敗: %v", err)
+		return fmt.Errorf("failed to prepare statement: %v", err)
 	}
 
 	app.lastCommit = time.Now()
