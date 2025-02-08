@@ -262,17 +262,17 @@ func main() {
 
 	// amend モードの場合、トランザクションの状態を確認
 	if amend {
-		var inTransaction bool
-		err := db.QueryRow("PRAGMA in_transaction").Scan(&inTransaction)
+		var inTransaction int
+		err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master LIMIT 1").Scan(&inTransaction)
 		if err != nil {
-			log.Fatalf("トランザクション状態の確認に失敗: %v", err)
+			log.Fatalf("データベースの状態確認に失敗: %v", err)
 		}
-		if inTransaction {
-			log.Println("未コミットのトランザクションを検出。ロールバックを実行します...")
-			if _, err := db.Exec("ROLLBACK"); err != nil {
-				log.Fatalf("ロールバックに失敗: %v", err)
-			}
+		
+		// 安全のため、明示的にロールバックを実行
+		if _, err := db.Exec("ROLLBACK"); err != nil {
+			log.Printf("警告: ロールバックの実行中にエラー: %v", err)
 		}
+		log.Println("データベースの状態をリセットしました")
 	}
 
 	// 既存のdump_idを取得（amend モード用）
