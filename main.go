@@ -110,7 +110,7 @@ func (ps *ProgressStats) LogProgress(currentPath string) {
 
 func (app *AppContext) parformCleanup() {
 	app.cleanup.Do(func() {
-		log.Println("シャットダウンを開始します...")
+		log.Println("Starting shutdown...")
 
 		if app.metadataChan != nil && !app.channelClosed {
 			close(app.metadataChan)
@@ -118,7 +118,7 @@ func (app *AppContext) parformCleanup() {
 		}
 
 		if app.wg != nil {
-			log.Println("保留中の操作の完了を待機中...")
+			log.Println("Waiting for pending operations to complete...")
 			app.wg.Wait()
 		}
 
@@ -405,11 +405,13 @@ func main() {
 		}
 	}()
 
+	var newFilesFound int64 // Track count of new files
+	const logInterval = 1000 // Log every 1000 new files
+
 	// File system scan
 	semaphore := make(chan struct{}, workerCount)
-	scanComplete := make(chan struct{}) // Channel to notify scan completion
+	scanComplete := make(chan struct{})
 	
-	// Execute filesystem scan in a separate goroutine
 	var scanWg sync.WaitGroup
 	scanWg.Add(1)
 	go func() {
@@ -435,8 +437,10 @@ func main() {
 					if _, exists := processedPaths[relPath]; exists {
 						return nil
 					}
-					// 新しいファイルを見つけた時のログ
-					log.Printf("新規ファイルを処理: %s", relPath)
+					count := atomic.AddInt64(&newFilesFound, 1)
+					if count%logInterval == 0 {
+						log.Printf("Found %d new files to process", count)
+					}
 				}
 
 				semaphore <- struct{}{} // Acquire semaphore
@@ -457,8 +461,15 @@ func main() {
 			}
 		})
 
-		// Post-scan processing
-		close(scanComplete) // Notify scan completion
+		// Final summary after scan completion
+		if amend {
+			totalNew := atomic.LoadInt64(&newFilesFound)
+			if totalNew == 0 {
+				log.Println("No new files found. All files already processed.")
+			} else {
+				log.Printf("Total new files found: %d", totalNew)
+			}
+		}
 
 		// Empty the semaphore
 		for i := 0; i < workerCount; i++ {
@@ -469,6 +480,8 @@ func main() {
 			log.Printf("Error during file walk: %v", err)
 			app.cancel()
 		}
+
+		close(scanComplete) // Notify scan completion
 	}()
 
 	// Wait for scan completion and all workers to finish
