@@ -43,7 +43,6 @@ type FileMetadata struct {
 }
 
 type ProgressStats struct {
-	totalFiles     int64
 	processedFiles int64
 	processedBytes int64
 	startTime      time.Time
@@ -90,8 +89,6 @@ func (ps *ProgressStats) LogProgress(currentPath string) {
 		now := time.Now()
 		elapsed := now.Sub(ps.startTime)
 		filesPerSecond := float64(processedFiles) / elapsed.Seconds()
-		totalFiles := atomic.LoadInt64(&ps.totalFiles)
-		percentComplete := float64(processedFiles) / float64(totalFiles) * 100
 
 		// Get current directory (truncate if too long)
 		currentDir := filepath.Dir(currentPath)
@@ -99,8 +96,8 @@ func (ps *ProgressStats) LogProgress(currentPath string) {
 			currentDir = "..." + currentDir[len(currentDir)-47:]
 		}
 
-		log.Printf("[Progress] Processed %d/%d files (%.1f%%) at %.1f files/sec - Current dir: %s",
-			processedFiles, totalFiles, percentComplete, filesPerSecond, currentDir)
+		log.Printf("[Progress] Processed %d/ files at %.1f files/sec - Current dir: %s",
+			processedFiles, filesPerSecond, currentDir)
 
 		ps.lastLogTime = now
 		ps.mutex.Unlock()
