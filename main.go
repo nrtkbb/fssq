@@ -136,13 +136,30 @@ func (app *AppContext) parformCleanup() {
 		if app.db != nil {
 			log.Println("Cleaning up database...")
 
-			// Force WAL checkpoint
+			// Force WAL checkpoint before closing
 			if _, err := app.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 				log.Printf("Error executing WAL checkpoint: %v", err)
 			}
 
 			if err := app.db.Close(); err != nil {
 				log.Printf("Error closing database: %v", err)
+			}
+
+			// WALファイルとSHMファイルの存在確認とクリーンアップ
+			var dbPath string
+			err := app.db.QueryRow("PRAGMA database_list").Scan(nil, &dbPath, nil)
+			if err != nil {
+				log.Printf("Warning: データベースパスの取得に失敗: %v", err)
+			} else {
+				walPath := dbPath + "-wal"
+				shmPath := dbPath + "-shm"
+				
+				if _, err := os.Stat(walPath); err == nil {
+					log.Printf("WALファイルが残存しています: %s", walPath)
+				}
+				if _, err := os.Stat(shmPath); err == nil {
+					log.Printf("SHMファイルが残存しています: %s", shmPath)
+				}
 			}
 		}
 
@@ -242,6 +259,21 @@ func main() {
 		log.Fatalf("Failed to begin transaction: %v", err)
 	}
 	app.tx = tx
+
+	// amend モードの場合、トランザクションの状態を確認
+	if amend {
+		var inTransaction bool
+		err := db.QueryRow("PRAGMA in_transaction").Scan(&inTransaction)
+		if err != nil {
+			log.Fatalf("トランザクション状態の確認に失敗: %v", err)
+		}
+		if inTransaction {
+			log.Println("未コミットのトランザクションを検出。ロールバックを実行します...")
+			if _, err := db.Exec("ROLLBACK"); err != nil {
+				log.Fatalf("ロールバックに失敗: %v", err)
+			}
+		}
+	}
 
 	// 既存のdump_idを取得（amend モード用）
 	var dumpID int64
@@ -507,9 +539,21 @@ func createDumpEntry(tx *sql.Tx, storageName string) (int64, error) {
 }
 
 func setupDatabase(dbPath string) (*sql.DB, error) {
+	// データベースを開く前にWALのリカバリを確認
+	if _, err := os.Stat(dbPath + "-wal"); err == nil {
+		log.Println("WALファイルが見つかりました。リカバリを実行します...")
+	}
+
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %v", err)
+	}
+
+	// WALモード設定の前にチェックポイントを実行
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		log.Printf("Warning: WALチェックポイントの実行に失敗: %v", err)
+	} else {
+		log.Println("WALチェックポイントが正常に実行されました")
 	}
 
 	// Performance settings
@@ -519,9 +563,20 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 		PRAGMA cache_size = -2000000;
 		PRAGMA temp_store = MEMORY;
 		PRAGMA busy_timeout = 5000;
+		PRAGMA foreign_keys = ON;
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set database pragmas: %v", err)
+	}
+
+	// データベースの整合性チェック
+	var integrityCheck string
+	err = db.QueryRow("PRAGMA quick_check").Scan(&integrityCheck)
+	if err != nil {
+		return nil, fmt.Errorf("データベースの整合性チェックに失敗: %v", err)
+	}
+	if integrityCheck != "ok" {
+		return nil, fmt.Errorf("データベースの整合性に問題があります: %s", integrityCheck)
 	}
 
 	return db, nil
