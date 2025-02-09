@@ -9,6 +9,7 @@ import (
 	"github.com/nrtkbb/fssq/cmd/merge"
 	"github.com/nrtkbb/fssq/cmd/migrate"
 	"github.com/nrtkbb/fssq/cmd/scan"
+	"github.com/nrtkbb/fssq/cmd/serve"
 	"github.com/nrtkbb/fssq/cmd/version"
 )
 
@@ -20,6 +21,7 @@ func main() {
 	subcommands.Register(&scan.Command{}, "")
 	subcommands.Register(&merge.Command{}, "")
 	subcommands.Register(&migrate.Command{}, "")
+	subcommands.Register(&serve.Command{}, "")
 	subcommands.Register(&version.Command{}, "")
 
 	// Set the default subcommand to help if no subcommand is specified
