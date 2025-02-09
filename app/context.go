@@ -17,17 +17,20 @@ type AppContext struct {
 	MetadataChan  chan models.FileMetadata
 	Wg            *sync.WaitGroup
 	Stats         *models.ProgressStats
+	Context       context.Context
 	Cancel        context.CancelFunc
 	Cleanup       sync.Once
 	LastCommit    time.Time
 	ChannelClosed bool
 }
 
-func NewAppContext(ctx context.Context, cancel context.CancelFunc) *AppContext {
+func NewAppContext(parentCtx context.Context) *AppContext {
+	ctx, cancel := context.WithCancel(parentCtx)
 	return &AppContext{
-		Wg:     &sync.WaitGroup{},
-		Cancel: cancel,
-		Stats:  NewProgressStats(),
+		Context: ctx,
+		Wg:      &sync.WaitGroup{},
+		Cancel:  cancel,
+		Stats:   NewProgressStats(),
 	}
 }
 

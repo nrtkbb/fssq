@@ -48,12 +48,27 @@ jobs:
 
       - name: Build
         run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           mkdir -p dist
-          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -o dist/fssq-darwin-amd64
-          cd dist && tar czf fssq-darwin-amd64.tar.gz fssq-darwin-amd64
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build \
+            -ldflags "-s -w \
+              -X github.com/nrtkbb/fssq/cmd/version.Version=${VERSION} \
+              -X github.com/nrtkbb/fssq/cmd/version.Commit=${COMMIT} \
+              -X github.com/nrtkbb/fssq/cmd/version.Date=${BUILD_DATE}" \
+            -tags=sqlite_foreign_keys \
+            -o dist/fssq-darwin-amd64
+          
+          mkdir -p dist/db/migrations
+          cp db/migrations/*.sql dist/db/migrations/
+          
+          cd dist && tar czf fssq-darwin-amd64.tar.gz fssq-darwin-amd64 db/
 
-      - name: Generate schema.sql hash
-        run: shasum -a 256 schema.sql > dist/schema.sql.sha256
+      - name: Generate migrations hash
+        run: |
+          cd dist/db/migrations
+          shasum -a 256 *.sql > ../../migrations.sha256
 
       - name: Get version from tag
         id: get_version
@@ -65,8 +80,7 @@ jobs:
           name: Release ${{ steps.get_version.outputs.VERSION }}
           files: |
             dist/fssq-darwin-amd64.tar.gz
-            schema.sql
-            dist/schema.sql.sha256
+            dist/migrations.sha256
           draft: false
           prerelease: false
           generate_release_notes: true
