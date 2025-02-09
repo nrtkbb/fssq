@@ -5,14 +5,14 @@ import (
 	"log"
 )
 
-// DumpInfo はダンプの情報を保持する構造体
+// DumpInfo is a structure that holds dump information
 type DumpInfo struct {
 	DumpID         int64
 	IsAmend        bool
 	ProcessedPaths map[string]struct{}
 }
 
-// CreateOrResumeDump は新しいダンプを作成するか、既存のダンプを再開します
+// CreateOrResumeDump creates a new dump or resumes an existing one
 func CreateOrResumeDump(db *sql.DB, storageName string, amend bool) *DumpInfo {
 	info := &DumpInfo{
 		ProcessedPaths: make(map[string]struct{}),
