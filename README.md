@@ -1,6 +1,6 @@
-# FSSQ (File System SQLite Query)
+# fssq (File System to SQLite)
 
-FSSQ is a high-performance tool for analyzing file system metadata through SQLite. It recursively scans directories, stores metadata in a SQLite database, and enables powerful SQL-based analysis of your file system with minimal memory footprint.
+fssq is a high-performance tool for analyzing file system metadata through SQLite. It recursively scans directories, stores metadata in a SQLite database, and enables powerful SQL-based analysis of your file system with minimal memory footprint.
 
 ## Features
 
