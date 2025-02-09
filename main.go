@@ -28,23 +28,23 @@ import (
 )
 
 type FileMetadata struct {
-	FilePath           string
-	FileName           string
-	Directory          string
-	SizeBytes          int64
-	CreationTimeUTC    int64
+	FilePath            string
+	FileName            string
+	Directory           string
+	SizeBytes           int64
+	CreationTimeUTC     int64
 	ModificationTimeUTC int64
-	AccessTimeUTC      int64
-	FileMode           string
-	IsDirectory        bool
-	IsFile             bool
-	IsSymlink          bool
-	IsHidden           bool
-	IsSystem           bool
-	IsArchive          bool
-	IsReadonly         bool
-	FileExtension      string
-	SHA256             *string
+	AccessTimeUTC       int64
+	FileMode            string
+	IsDirectory         bool
+	IsFile              bool
+	IsSymlink           bool
+	IsHidden            bool
+	IsSystem            bool
+	IsArchive           bool
+	IsReadonly          bool
+	FileExtension       string
+	SHA256              *string
 }
 
 type ProgressStats struct {
@@ -56,15 +56,15 @@ type ProgressStats struct {
 }
 
 type AppContext struct {
-	db           *sql.DB
-	tx           *sql.Tx
-	stmt         *sql.Stmt
-	metadataChan chan FileMetadata
-	wg           *sync.WaitGroup
-	stats        *ProgressStats
-	cancel       context.CancelFunc
-	cleanup      sync.Once
-	lastCommit   time.Time
+	db            *sql.DB
+	tx            *sql.Tx
+	stmt          *sql.Stmt
+	metadataChan  chan FileMetadata
+	wg            *sync.WaitGroup
+	stats         *ProgressStats
+	cancel        context.CancelFunc
+	cleanup       sync.Once
+	lastCommit    time.Time
 	channelClosed bool
 }
 
@@ -158,7 +158,7 @@ func (app *AppContext) parformCleanup() {
 			} else {
 				walPath := dbPath + "-wal"
 				shmPath := dbPath + "-shm"
-				
+
 				if _, err := os.Stat(walPath); err == nil {
 					log.Printf("WAL file still exists: %s", walPath)
 				}
@@ -194,7 +194,7 @@ func main() {
 
 	// Force quit flag
 	var forceQuit atomic.Bool
-	
+
 	go func() {
 		for sig := range sigChan {
 			log.Printf("Received signal: %v", sig)
@@ -202,11 +202,11 @@ func main() {
 				log.Println("Forcing immediate shutdown...")
 				os.Exit(1)
 			}
-			
+
 			forceQuit.Store(true)
 			log.Println("Press Ctrl+C again to force quit. Wait for normal shutdown to complete...")
 			cancel() // Cancel context to notify goroutines
-			
+
 			// Reset forceQuit flag after 5 seconds
 			go func() {
 				time.Sleep(5 * time.Second)
@@ -215,7 +215,17 @@ func main() {
 		}
 	}()
 
-	storageName, rootDir, dbPath, skipHash, mergeSource, amend := parseFlags()
+	storageName, rootDir, dbPath, skipHash, mergeSource, amend, migrateOnly := parseFlags()
+
+	// マイグレーションモードの場合
+	if migrateOnly {
+		log.Printf("Running database migrations for %s...", dbPath)
+		if err := runMigrations(dbPath); err != nil {
+			log.Fatalf("Failed to run migrations: %v", err)
+		}
+		log.Println("Database migrations completed successfully")
+		return
+	}
 
 	// If merge mode is specified, perform merge and exit
 	if mergeSource != "" {
@@ -257,7 +267,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to begin transaction: %v", err)
 		}
-		
+
 		// Get existing dump_id
 		err = tx.QueryRow(`
 			SELECT dump_id FROM dumps 
@@ -283,7 +293,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to begin transaction: %v", err)
 		}
-		
+
 		dumpID, err = createDumpEntry(tx, storageName)
 		if err != nil {
 			tx.Rollback()
@@ -323,7 +333,7 @@ func main() {
 	app.wg.Add(1)
 	go func() {
 		defer app.wg.Done()
-		
+
 		// Initial transaction setup
 		if err := app.refreshTransaction(); err != nil {
 			log.Printf("Failed to setup initial transaction: %v", err)
@@ -333,7 +343,7 @@ func main() {
 
 		const commitInterval = 30 * time.Second // Commit every 30 seconds
 		processedSinceCommit := 0
-		const commitThreshold = 10000          // Or commit every 10000 records
+		const commitThreshold = 10000 // Or commit every 10000 records
 
 		for metadata := range metadataChan {
 			select {
@@ -353,7 +363,7 @@ func main() {
 					log.Printf("Error inserting metadata for %s: %v", metadata.FilePath, err)
 				}
 				atomic.AddInt64(&stats.processedBytes, metadata.SizeBytes)
-				
+
 				processedSinceCommit++
 
 				// Commit when time interval elapsed or record threshold reached
@@ -377,7 +387,7 @@ func main() {
 		}
 	}()
 
-	var newFilesFound int64 // Track count of new files
+	var newFilesFound int64  // Track count of new files
 	const logInterval = 1000 // Log every 1000 new files
 	// Modify metadata collection part
 	scanComplete := make(chan struct{})
@@ -465,32 +475,42 @@ func main() {
 	app.wg.Wait()
 }
 
-func parseFlags() (string, string, string, bool, string, bool) {
+func parseFlags() (string, string, string, bool, string, bool, bool) {
 	storageName := flag.String("storage", "", "Storage name identifier")
 	rootDir := flag.String("root", "", "Root directory to scan")
 	dbPath := flag.String("db", "", "SQLite database path")
 	skipHash := flag.Bool("skip-hash", false, "Skip SHA256 hash calculation")
 	mergeSource := flag.String("merge", "", "Source database to merge from")
 	amend := flag.Bool("amend", false, "Continue from last incomplete dump")
+	migrateOnly := flag.Bool("migrate", false, "Only run database migrations")
 	flag.Parse()
 
-	// Validate normal mode
-	if *mergeSource == "" {
-		if *storageName == "" || *rootDir == "" || *dbPath == "" {
-			log.Fatal("All arguments are required: -storage, -root, -db")
+	// マイグレーションモードの場合はdbPathのみ必須
+	if *migrateOnly {
+		if *dbPath == "" {
+			log.Fatal("Database path (-db) is required for migration")
 		}
-		return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource, *amend
+		// マイグレーションモードでは他のパラメータは無視
+		return "", "", *dbPath, false, "", false, *migrateOnly
 	}
 
-	// Validate merge mode
-	if *dbPath == "" {
-		log.Fatal("Destination database (-db) is required for merge operation")
-	}
-	if *mergeSource == *dbPath {
-		log.Fatal("Source and destination databases must be different")
+	// マージモードのバリデーション
+	if *mergeSource != "" {
+		if *dbPath == "" {
+			log.Fatal("Destination database (-db) is required for merge operation")
+		}
+		if *mergeSource == *dbPath {
+			log.Fatal("Source and destination databases must be different")
+		}
+		return "", "", *dbPath, *skipHash, *mergeSource, false, false
 	}
 
-	return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource, *amend
+	// 通常モードのバリデーション
+	if *storageName == "" || *rootDir == "" || *dbPath == "" {
+		log.Fatal("All arguments are required: -storage, -root, -db")
+	}
+
+	return *storageName, *rootDir, *dbPath, *skipHash, *mergeSource, *amend, *migrateOnly
 }
 
 func createDumpEntry(tx *sql.Tx, storageName string) (int64, error) {
@@ -569,7 +589,7 @@ func needsMigration(db *sql.DB) bool {
 		SELECT COUNT(*) FROM sqlite_master 
 		WHERE type='table' AND name='schema_migrations'
 	`).Scan(&exists)
-	
+
 	return err != nil || exists == 0
 }
 
@@ -587,7 +607,7 @@ func runMigrations(dbPath string) error {
 
 	config := &sqlite3.Config{
 		DatabaseName: dbPath,
-		NoTxWrap:    true, // sqlite3ではDDLをトランザクションで囲めないため
+		NoTxWrap:     true, // sqlite3ではDDLをトランザクションで囲めないため
 	}
 	driver, err := sqlite3.WithInstance(db, config)
 	if err != nil {
@@ -668,23 +688,23 @@ func collectMetadata(path string, info os.FileInfo, relPath string, skipHash boo
 	}
 
 	return FileMetadata{
-		FilePath:           relPath,
-		FileName:           info.Name(),
-		Directory:          filepath.Dir(relPath),
-		SizeBytes:          info.Size(),
-		CreationTimeUTC:    stat.Birthtimespec.Sec,
+		FilePath:            relPath,
+		FileName:            info.Name(),
+		Directory:           filepath.Dir(relPath),
+		SizeBytes:           info.Size(),
+		CreationTimeUTC:     stat.Birthtimespec.Sec,
 		ModificationTimeUTC: stat.Mtimespec.Sec,
-		AccessTimeUTC:      stat.Atimespec.Sec,
-		FileMode:           formatFileMode(info.Mode()),
-		IsDirectory:        info.IsDir(),
-		IsFile:             !info.IsDir(),
-		IsSymlink:          info.Mode()&os.ModeSymlink != 0,
-		IsHidden:           strings.HasPrefix(filepath.Base(path), "."),
-		IsSystem:           isSystem,
-		IsArchive:          isArchive,
-		IsReadonly:         info.Mode()&0200 == 0,
-		FileExtension:      strings.ToLower(filepath.Ext(path)),
-		SHA256:             sha256Hash,
+		AccessTimeUTC:       stat.Atimespec.Sec,
+		FileMode:            formatFileMode(info.Mode()),
+		IsDirectory:         info.IsDir(),
+		IsFile:              !info.IsDir(),
+		IsSymlink:           info.Mode()&os.ModeSymlink != 0,
+		IsHidden:            strings.HasPrefix(filepath.Base(path), "."),
+		IsSystem:            isSystem,
+		IsArchive:           isArchive,
+		IsReadonly:          info.Mode()&0200 == 0,
+		FileExtension:       strings.ToLower(filepath.Ext(path)),
+		SHA256:              sha256Hash,
 	}
 }
 
@@ -917,7 +937,7 @@ func (app *AppContext) refreshTransaction() error {
 			}
 			app.stmt = nil
 		}
-		
+
 		// Commit current transaction
 		if err := app.tx.Commit(); err != nil {
 			if rbErr := app.tx.Rollback(); rbErr != nil {
