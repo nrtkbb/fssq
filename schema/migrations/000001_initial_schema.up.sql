@@ -1,6 +1,3 @@
--- File: schema.sql
--- Description: Complete database schema for file metadata system
-
 PRAGMA foreign_keys = ON;
 PRAGMA encoding = 'UTF-8';
 

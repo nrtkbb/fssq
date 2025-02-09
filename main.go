@@ -18,6 +18,11 @@ import (
 	"syscall"
 	"time"
 
+	"embed"
+
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database/sqlite3"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/sys/unix"
 )
@@ -70,6 +75,9 @@ const (
 	logInterval      = 5    // Detailed log output interval (seconds)
 	filesPerLog      = 1000 // Threshold for file processing count before logging
 )
+
+//go:embed schema/migrations/*.sql
+var migrationsFS embed.FS
 
 func NewProgressStats() *ProgressStats {
 	now := time.Now()
@@ -502,21 +510,41 @@ func createDumpEntry(tx *sql.Tx, storageName string) (int64, error) {
 }
 
 func setupDatabase(dbPath string) (*sql.DB, error) {
-	// Check for WAL recovery before opening database
-	if _, err := os.Stat(dbPath + "-wal"); err == nil {
-		log.Println("Found WAL file. Executing recovery...")
+	// Create directory for database file
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create database directory: %v", err)
 	}
 
+	// Check if database file exists
+	needsInit := false
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		needsInit = true
+		// Create empty file
+		if _, err := os.Create(dbPath); err != nil {
+			return nil, fmt.Errorf("failed to create database file: %v", err)
+		}
+	}
+
+	// sql.Open only validates settings and doesn't establish actual connection,
+	// so it won't error even with empty file. Real connection check is done with Ping()
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %v", err)
 	}
 
-	// Execute checkpoint before setting WAL mode
-	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		log.Printf("Warning: Failed to execute WAL checkpoint: %v", err)
-	} else {
-		log.Println("WAL checkpoint executed successfully")
+	// Verify database connection
+	// Ping succeeds even with empty file, so we also check for basic tables
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to connect to database: %v", err)
+	}
+
+	if needsInit || needsMigration(db) {
+		log.Println("Running database migrations...")
+		if err := runMigrations(dbPath); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to run migrations: %v", err)
+		}
 	}
 
 	// Performance settings
@@ -532,17 +560,54 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to set database pragmas: %v", err)
 	}
 
-	// Check database integrity
-	var integrityCheck string
-	err = db.QueryRow("PRAGMA quick_check").Scan(&integrityCheck)
+	return db, nil
+}
+
+func needsMigration(db *sql.DB) bool {
+	var exists int
+	err := db.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master 
+		WHERE type='table' AND name='schema_migrations'
+	`).Scan(&exists)
+	
+	return err != nil || exists == 0
+}
+
+func runMigrations(dbPath string) error {
+	d, err := iofs.New(migrationsFS, "schema/migrations")
 	if err != nil {
-		return nil, fmt.Errorf("failed to check database integrity: %v", err)
-	}
-	if integrityCheck != "ok" {
-		return nil, fmt.Errorf("database integrity check failed: %s", integrityCheck)
+		return fmt.Errorf("failed to create migration source: %v", err)
 	}
 
-	return db, nil
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	config := &sqlite3.Config{
+		DatabaseName: dbPath,
+		NoTxWrap:    true, // sqlite3ではDDLをトランザクションで囲めないため
+	}
+	driver, err := sqlite3.WithInstance(db, config)
+	if err != nil {
+		return fmt.Errorf("failed to create migration driver: %v", err)
+	}
+
+	m, err := migrate.NewWithInstance(
+		"iofs", d,
+		"sqlite3", driver,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create migrate instance: %v", err)
+	}
+	defer m.Close()
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return fmt.Errorf("failed to run migrations: %v", err)
+	}
+
+	return nil
 }
 
 func formatFileMode(mode os.FileMode) string {
