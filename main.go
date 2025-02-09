@@ -297,7 +297,7 @@ func main() {
 	if amend {
 		rows, err := app.tx.Query(`
 			SELECT file_path 
-			FROM file_metadata_template 
+			FROM file_metadata 
 			WHERE dump_id = ?
 		`, dumpID)
 		if err != nil {
@@ -789,7 +789,7 @@ func mergeDatabase(ctx context.Context, sourceDB, destDB string) error {
 
 	// Copy file metadata with updated dump_ids
 	metadataStmt, err := destTx.Prepare(`
-		INSERT INTO file_metadata_template (
+		INSERT INTO file_metadata (
 			dump_id, file_path, file_name, directory, size_bytes,
 			creation_time_utc, modification_time_utc, access_time_utc,
 			file_mode, is_directory, is_file, is_symlink,
@@ -811,7 +811,7 @@ func mergeDatabase(ctx context.Context, sourceDB, destDB string) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				query := `SELECT * FROM file_metadata_template WHERE dump_id = ? LIMIT ? OFFSET ?`
+				query := `SELECT * FROM file_metadata WHERE dump_id = ? LIMIT ? OFFSET ?`
 				rows, err := source.Query(query, oldDumpID, batchSize, offset)
 				if err != nil {
 					return fmt.Errorf("failed to query metadata: %v", err)
@@ -936,7 +936,7 @@ func (app *AppContext) refreshTransaction() error {
 
 	// Create new prepared statement
 	app.stmt, err = app.tx.Prepare(`
-		INSERT INTO file_metadata_template (
+		INSERT INTO file_metadata (
 			dump_id, file_path, file_name, directory, size_bytes,
 			creation_time_utc, modification_time_utc, access_time_utc,
 			file_mode, is_directory, is_file, is_symlink,
