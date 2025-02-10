@@ -10,6 +10,7 @@ import (
 	"github.com/nrtkbb/fssq/cmd/migrate"
 	"github.com/nrtkbb/fssq/cmd/scan"
 	"github.com/nrtkbb/fssq/cmd/serve"
+	"github.com/nrtkbb/fssq/cmd/testdata"
 	"github.com/nrtkbb/fssq/cmd/version"
 )
 
@@ -23,6 +24,7 @@ func main() {
 	subcommands.Register(&migrate.Command{}, "")
 	subcommands.Register(&serve.Command{}, "")
 	subcommands.Register(&version.Command{}, "")
+	subcommands.Register(&testdata.Command{}, "")
 
 	// Set the default subcommand to help if no subcommand is specified
 	flag.Parse()

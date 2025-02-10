@@ -1,4 +1,5 @@
 fssq
+/testdata
 *.db
 *.db-journal
 *.db-lock
