@@ -3,11 +3,13 @@ package api
 import (
 	"database/sql"
 	"net/http"
+	"reflect"
 	"strconv"
 
 	"github.com/labstack/echo/v4"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Handler struct {
@@ -88,16 +90,26 @@ type PaginatedResponse struct {
 	HasNext    bool        `json:"has_next"`
 }
 
-// NewPaginatedResponse creates a new paginated response
-func NewPaginatedResponse(data interface{}, page int, perPage int, total int) *PaginatedResponse {
+// NewPaginatedResponse creates a new paginated response and adds telemetry
+func NewPaginatedResponse(c echo.Context, data interface{}, page int, perPage int, total int) *PaginatedResponse {
 	totalPages := (total + perPage - 1) / perPage
+	hasNext := page < totalPages
+
+	// Use span from request context
+	if span := trace.SpanFromContext(c.Request().Context()); span != nil {
+		span.SetAttributes(
+			attribute.Bool("has_next_page", hasNext),
+			attribute.Int("response_items", reflect.ValueOf(data).Len()),
+		)
+	}
+
 	return &PaginatedResponse{
 		Data:       data,
 		Page:       page,
 		PerPage:    perPage,
 		Total:      total,
 		TotalPages: totalPages,
-		HasNext:    page < totalPages,
+		HasNext:    hasNext,
 	}
 }
 
@@ -142,6 +154,15 @@ func (h *Handler) getPageFromQuery(c echo.Context, total int) (int, error) {
 		return 0, echo.NewHTTPError(http.StatusBadRequest, "Page number exceeds total pages. Total pages: "+strconv.Itoa(totalPages))
 	}
 
+	// Add OpenTelemetry attributes for pagination using the parent span from request context
+	span := trace.SpanFromContext(c.Request().Context())
+	span.SetAttributes(
+		attribute.Int("page", page),
+		attribute.Int("per_page", perPage),
+		attribute.Int("total", total),
+		attribute.Int("total_pages", totalPages),
+	)
+
 	return page, nil
 }
 
@@ -151,6 +172,9 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 	tracer := otel.Tracer("api/handlers")
 	ctx, span := tracer.Start(ctx, "ListDirectory")
 	defer span.End()
+
+	// Update request context with tracing context
+	c.SetRequest(c.Request().WithContext(ctx))
 
 	path := c.QueryParam("path")
 	if path == "" {
@@ -240,7 +264,7 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 		entries = append(entries, entry)
 	}
 
-	return c.JSON(http.StatusOK, NewPaginatedResponse(entries, page, perPage, total))
+	return c.JSON(http.StatusOK, NewPaginatedResponse(c, entries, page, perPage, total))
 }
 
 // GetFileMetadata returns detailed metadata for a specific file
@@ -249,6 +273,9 @@ func (h *Handler) GetFileMetadata(c echo.Context) error {
 	tracer := otel.Tracer("api/handlers")
 	ctx, span := tracer.Start(ctx, "GetFileMetadata")
 	defer span.End()
+
+	// Update request context with tracing context
+	c.SetRequest(c.Request().WithContext(ctx))
 
 	path := c.QueryParam("path")
 	if path == "" {
@@ -267,7 +294,7 @@ func (h *Handler) GetFileMetadata(c echo.Context) error {
 
 	var metadata FileMetadata
 	var sha256Str sql.NullString
-	err = h.db.QueryRow(`
+	err = h.db.QueryRowContext(ctx, `
 		SELECT 
 			file_name,
 			file_path,
@@ -320,6 +347,9 @@ func (h *Handler) GetStats(c echo.Context) error {
 	ctx, span := tracer.Start(ctx, "GetStats")
 	defer span.End()
 
+	// Update request context with tracing context
+	c.SetRequest(c.Request().WithContext(ctx))
+
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
 		span.RecordError(err)
@@ -337,7 +367,7 @@ func (h *Handler) GetStats(c echo.Context) error {
 		ScanTime         int64  `json:"scan_time"`
 	}
 
-	err = h.db.QueryRow(`
+	err = h.db.QueryRowContext(ctx, `
 		SELECT 
 			d.file_count,
 			d.directory_count,
@@ -371,6 +401,9 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 	tracer := otel.Tracer("api/handlers")
 	ctx, span := tracer.Start(ctx, "SearchFiles")
 	defer span.End()
+
+	// Update request context with tracing context
+	c.SetRequest(c.Request().WithContext(ctx))
 
 	pattern := c.QueryParam("pattern")
 	if pattern == "" {
@@ -447,7 +480,7 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 		entries = append(entries, entry)
 	}
 
-	return c.JSON(http.StatusOK, NewPaginatedResponse(entries, page, perPage, total))
+	return c.JSON(http.StatusOK, NewPaginatedResponse(c, entries, page, perPage, total))
 }
 
 // GetExtensionStats returns statistics about file extensions
@@ -456,6 +489,9 @@ func (h *Handler) GetExtensionStats(c echo.Context) error {
 	tracer := otel.Tracer("api/handlers")
 	ctx, span := tracer.Start(ctx, "GetExtensionStats")
 	defer span.End()
+
+	// Update request context with tracing context
+	c.SetRequest(c.Request().WithContext(ctx))
 
 	limit := c.QueryParam("limit")
 	if limit == "" {
@@ -518,6 +554,9 @@ func (h *Handler) GetDirectoryTree(c echo.Context) error {
 	tracer := otel.Tracer("api/handlers")
 	ctx, span := tracer.Start(ctx, "GetDirectoryTree")
 	defer span.End()
+
+	// Update request context with tracing context
+	c.SetRequest(c.Request().WithContext(ctx))
 
 	path := c.QueryParam("path")
 	if path == "" {
@@ -592,6 +631,9 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 	tracer := otel.Tracer("api/handlers")
 	ctx, span := tracer.Start(ctx, "AdvancedSearch")
 	defer span.End()
+
+	// Update request context with tracing context
+	c.SetRequest(c.Request().WithContext(ctx))
 
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
@@ -705,7 +747,7 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 		entries = append(entries, entry)
 	}
 
-	return c.JSON(http.StatusOK, NewPaginatedResponse(entries, page, perPage, total))
+	return c.JSON(http.StatusOK, NewPaginatedResponse(c, entries, page, perPage, total))
 }
 
 // CompareDumps compares two dumps and returns changes
@@ -714,6 +756,9 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 	tracer := otel.Tracer("api/handlers")
 	ctx, span := tracer.Start(ctx, "CompareDumps")
 	defer span.End()
+
+	// Update request context with tracing context
+	c.SetRequest(c.Request().WithContext(ctx))
 
 	oldStorage := c.QueryParam("old_storage")
 	newStorage := c.QueryParam("new_storage")
@@ -821,7 +866,7 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 		changes = append(changes, change)
 	}
 
-	return c.JSON(http.StatusOK, NewPaginatedResponse(changes, page, perPage, total))
+	return c.JSON(http.StatusOK, NewPaginatedResponse(c, changes, page, perPage, total))
 }
 
 // GetCacheStatus returns the current status of caches
@@ -830,6 +875,9 @@ func (h *Handler) GetCacheStatus(c echo.Context) error {
 	tracer := otel.Tracer("api/handlers")
 	ctx, span := tracer.Start(ctx, "GetCacheStatus")
 	defer span.End()
+
+	// Update request context with tracing context
+	c.SetRequest(c.Request().WithContext(ctx))
 
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
