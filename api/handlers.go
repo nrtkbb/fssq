@@ -139,7 +139,7 @@ func (h *Handler) getPageFromQuery(c echo.Context, total int) (int, error) {
 	perPage := 100
 	totalPages := (total + perPage - 1) / perPage
 	if page > totalPages {
-		return 0, echo.NewHTTPError(http.StatusBadRequest, "Page number exceeds total pages")
+		return 0, echo.NewHTTPError(http.StatusBadRequest, "Page number exceeds total pages. Total pages: "+strconv.Itoa(totalPages))
 	}
 
 	return page, nil
@@ -173,11 +173,13 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 		WHERE directory = ? AND dump_id = ?
 	`, path, dumpID).Scan(&total)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
 	}
 
 	page, err := h.getPageFromQuery(c, total)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 	perPage := 100
@@ -209,6 +211,7 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 		LIMIT ? OFFSET ?
 	`, path, dumpID, perPage, offset)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to query directory")
 	}
 	defer rows.Close()
@@ -227,6 +230,7 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 			&dirCount,
 		)
 		if err != nil {
+			span.RecordError(err)
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to scan row")
 		}
 		if entry.IsDir {
@@ -294,9 +298,11 @@ func (h *Handler) GetFileMetadata(c echo.Context) error {
 		&sha256Str,
 	)
 	if err == sql.ErrNoRows {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusNotFound, "File not found")
 	}
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get file metadata")
 	}
 
@@ -352,6 +358,7 @@ func (h *Handler) GetStats(c echo.Context) error {
 		&stats.LatestModified,
 	)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get statistics")
 	}
 
@@ -391,11 +398,13 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 		)
 	`, dumpID, "%"+pattern+"%", "%"+pattern+"%").Scan(&total)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
 	}
 
 	page, err := h.getPageFromQuery(c, total)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 	perPage := 100
@@ -416,6 +425,7 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 		LIMIT ? OFFSET ?
 	`, dumpID, "%"+pattern+"%", "%"+pattern+"%", perPage, offset)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to search files")
 	}
 	defer rows.Close()
@@ -431,6 +441,7 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 			&entry.Modified,
 		)
 		if err != nil {
+			span.RecordError(err)
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to scan row")
 		}
 		entries = append(entries, entry)
@@ -459,7 +470,7 @@ func (h *Handler) GetExtensionStats(c echo.Context) error {
 	}
 	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
-	rows, err := h.db.Query(`
+	rows, err := h.db.QueryContext(ctx, `
 		SELECT 
 			file_extension,
 			file_count,
@@ -474,6 +485,7 @@ func (h *Handler) GetExtensionStats(c echo.Context) error {
 		LIMIT ?
 	`, dumpID, limit)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get extension statistics")
 	}
 	defer rows.Close()
@@ -491,6 +503,7 @@ func (h *Handler) GetExtensionStats(c echo.Context) error {
 			&stat.LastModified,
 		)
 		if err != nil {
+			span.RecordError(err)
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to scan row")
 		}
 		stats = append(stats, stat)
@@ -525,7 +538,7 @@ func (h *Handler) GetDirectoryTree(c echo.Context) error {
 	}
 	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
-	rows, err := h.db.Query(`
+	rows, err := h.db.QueryContext(ctx, `
 		SELECT 
 			directory,
 			parent_directory,
@@ -542,6 +555,7 @@ func (h *Handler) GetDirectoryTree(c echo.Context) error {
 		ORDER BY depth, directory
 	`, dumpID, path, path, dumpID, depth)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get directory tree")
 	}
 	defer rows.Close()
@@ -560,6 +574,7 @@ func (h *Handler) GetDirectoryTree(c echo.Context) error {
 			&dir.LastModified,
 		)
 		if err != nil {
+			span.RecordError(err)
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to scan row")
 		}
 		if parentPath.Valid {
@@ -643,11 +658,13 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 	copy(countParams, params)
 	err = h.db.QueryRowContext(ctx, "SELECT COUNT(*) "+baseQuery, countParams...).Scan(&total)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
 	}
 
 	page, err := h.getPageFromQuery(c, total)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 	perPage := 100
@@ -664,8 +681,9 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 			modification_time_utc
 	` + baseQuery + " LIMIT ? OFFSET ?"
 
-	rows, err := h.db.Query(query, params...)
+	rows, err := h.db.QueryContext(ctx, query, params...)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to search files")
 	}
 	defer rows.Close()
@@ -681,6 +699,7 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 			&entry.Modified,
 		)
 		if err != nil {
+			span.RecordError(err)
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to scan row")
 		}
 		entries = append(entries, entry)
@@ -714,11 +733,13 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 		SELECT COUNT(*) FROM comparison
 	`, oldStorage, newStorage).Scan(&total)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
 	}
 
 	page, err := h.getPageFromQuery(c, total)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 	perPage := 100
@@ -764,11 +785,12 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 		)`
 
 	// Get paginated results
-	rows, err := h.db.Query(baseQuery+`
+	rows, err := h.db.QueryContext(ctx, baseQuery+`
 		SELECT * FROM comparison
 		LIMIT ? OFFSET ?
 	`, oldStorage, newStorage, perPage, offset)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to compare dumps")
 	}
 	defer rows.Close()
@@ -786,6 +808,7 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 			&change.Status,
 		)
 		if err != nil {
+			span.RecordError(err)
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to scan row")
 		}
 
@@ -815,11 +838,12 @@ func (h *Handler) GetCacheStatus(c echo.Context) error {
 	}
 	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
-	rows, err := h.db.Query(`
+	rows, err := h.db.QueryContext(ctx, `
 		SELECT * FROM cache_status
 		WHERE dump_id = ?
 	`, dumpID)
 	if err != nil {
+		span.RecordError(err)
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get cache status")
 	}
 	defer rows.Close()
@@ -837,6 +861,7 @@ func (h *Handler) GetCacheStatus(c echo.Context) error {
 			&status.Status,
 		)
 		if err != nil {
+			span.RecordError(err)
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to scan row")
 		}
 		statuses = append(statuses, status)
