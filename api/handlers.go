@@ -6,6 +6,8 @@ import (
 	"strconv"
 
 	"github.com/labstack/echo/v4"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type Handler struct {
@@ -139,15 +141,23 @@ func (h *Handler) getPageFromQuery(c echo.Context) (int, error) {
 
 // ListDirectory returns the contents of a directory
 func (h *Handler) ListDirectory(c echo.Context) error {
+	ctx := c.Request().Context()
+	tracer := otel.Tracer("api/handlers")
+	ctx, span := tracer.Start(ctx, "ListDirectory")
+	defer span.End()
+
 	path := c.QueryParam("path")
 	if path == "" {
 		path = "."
 	}
+	span.SetAttributes(attribute.String("path", path))
 
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
+	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
 	page, err := h.getPageFromQuery(c)
 	if err != nil {
@@ -225,15 +235,25 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 
 // GetFileMetadata returns detailed metadata for a specific file
 func (h *Handler) GetFileMetadata(c echo.Context) error {
+	ctx := c.Request().Context()
+	tracer := otel.Tracer("api/handlers")
+	ctx, span := tracer.Start(ctx, "GetFileMetadata")
+	defer span.End()
+
 	path := c.QueryParam("path")
 	if path == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "Path parameter is required")
+		err := echo.NewHTTPError(http.StatusBadRequest, "Path parameter is required")
+		span.RecordError(err)
+		return err
 	}
+	span.SetAttributes(attribute.String("path", path))
 
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
+	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
 	var metadata FileMetadata
 	var sha256Str sql.NullString
@@ -283,10 +303,17 @@ func (h *Handler) GetFileMetadata(c echo.Context) error {
 
 // GetStats returns statistics about the filesystem
 func (h *Handler) GetStats(c echo.Context) error {
+	ctx := c.Request().Context()
+	tracer := otel.Tracer("api/handlers")
+	ctx, span := tracer.Start(ctx, "GetStats")
+	defer span.End()
+
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
+	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
 	var stats struct {
 		TotalFiles       int64  `json:"total_files"`
@@ -327,15 +354,25 @@ func (h *Handler) GetStats(c echo.Context) error {
 
 // SearchFiles searches for files matching the given pattern
 func (h *Handler) SearchFiles(c echo.Context) error {
+	ctx := c.Request().Context()
+	tracer := otel.Tracer("api/handlers")
+	ctx, span := tracer.Start(ctx, "SearchFiles")
+	defer span.End()
+
 	pattern := c.QueryParam("pattern")
 	if pattern == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "Pattern parameter is required")
+		err := echo.NewHTTPError(http.StatusBadRequest, "Pattern parameter is required")
+		span.RecordError(err)
+		return err
 	}
+	span.SetAttributes(attribute.String("pattern", pattern))
 
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
+	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
 	page, err := h.getPageFromQuery(c)
 	if err != nil {
@@ -398,15 +435,23 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 
 // GetExtensionStats returns statistics about file extensions
 func (h *Handler) GetExtensionStats(c echo.Context) error {
+	ctx := c.Request().Context()
+	tracer := otel.Tracer("api/handlers")
+	ctx, span := tracer.Start(ctx, "GetExtensionStats")
+	defer span.End()
+
 	limit := c.QueryParam("limit")
 	if limit == "" {
 		limit = "10"
 	}
+	span.SetAttributes(attribute.String("limit", limit))
 
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
+	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
 	rows, err := h.db.Query(`
 		SELECT 
@@ -450,20 +495,29 @@ func (h *Handler) GetExtensionStats(c echo.Context) error {
 
 // GetDirectoryTree returns the directory tree structure with statistics
 func (h *Handler) GetDirectoryTree(c echo.Context) error {
+	ctx := c.Request().Context()
+	tracer := otel.Tracer("api/handlers")
+	ctx, span := tracer.Start(ctx, "GetDirectoryTree")
+	defer span.End()
+
 	path := c.QueryParam("path")
 	if path == "" {
 		path = "."
 	}
+	span.SetAttributes(attribute.String("path", path))
 
 	depth := c.QueryParam("depth")
 	if depth == "" {
 		depth = "1"
 	}
+	span.SetAttributes(attribute.String("depth", depth))
 
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
+	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
 	rows, err := h.db.Query(`
 		SELECT 
@@ -513,9 +567,27 @@ func (h *Handler) GetDirectoryTree(c echo.Context) error {
 
 // AdvancedSearch performs advanced file search with multiple criteria
 func (h *Handler) AdvancedSearch(c echo.Context) error {
+	ctx := c.Request().Context()
+	tracer := otel.Tracer("api/handlers")
+	ctx, span := tracer.Start(ctx, "AdvancedSearch")
+	defer span.End()
+
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
+		span.RecordError(err)
 		return err
+	}
+	span.SetAttributes(attribute.Int64("dump_id", dumpID))
+
+	// Add search criteria to span attributes
+	if minSize := c.QueryParam("min_size"); minSize != "" {
+		span.SetAttributes(attribute.String("min_size", minSize))
+	}
+	if maxSize := c.QueryParam("max_size"); maxSize != "" {
+		span.SetAttributes(attribute.String("max_size", maxSize))
+	}
+	if extension := c.QueryParam("extension"); extension != "" {
+		span.SetAttributes(attribute.String("extension", extension))
 	}
 
 	page, err := h.getPageFromQuery(c)
@@ -613,11 +685,22 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 
 // CompareDumps compares two dumps and returns changes
 func (h *Handler) CompareDumps(c echo.Context) error {
+	ctx := c.Request().Context()
+	tracer := otel.Tracer("api/handlers")
+	ctx, span := tracer.Start(ctx, "CompareDumps")
+	defer span.End()
+
 	oldStorage := c.QueryParam("old_storage")
 	newStorage := c.QueryParam("new_storage")
 	if oldStorage == "" || newStorage == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "Both old_storage and new_storage parameters are required")
+		err := echo.NewHTTPError(http.StatusBadRequest, "Both old_storage and new_storage parameters are required")
+		span.RecordError(err)
+		return err
 	}
+	span.SetAttributes(
+		attribute.String("old_storage", oldStorage),
+		attribute.String("new_storage", newStorage),
+	)
 
 	page, err := h.getPageFromQuery(c)
 	if err != nil {
@@ -714,10 +797,17 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 
 // GetCacheStatus returns the current status of caches
 func (h *Handler) GetCacheStatus(c echo.Context) error {
+	ctx := c.Request().Context()
+	tracer := otel.Tracer("api/handlers")
+	ctx, span := tracer.Start(ctx, "GetCacheStatus")
+	defer span.End()
+
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
+	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
 	rows, err := h.db.Query(`
 		SELECT * FROM cache_status
