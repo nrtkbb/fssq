@@ -3,6 +3,7 @@ package api
 import (
 	"database/sql"
 	"net/http"
+	"strconv"
 
 	"github.com/labstack/echo/v4"
 )
@@ -79,6 +80,21 @@ func NewHandler(db *sql.DB) *Handler {
 	return &Handler{db: db}
 }
 
+// getDumpIDFromQuery gets and validates dump_id from query parameters
+func (h *Handler) getDumpIDFromQuery(c echo.Context) (int64, error) {
+	dumpIDStr := c.QueryParam("dump_id")
+	if dumpIDStr == "" {
+		return 0, echo.NewHTTPError(http.StatusBadRequest, "dump_id parameter is required")
+	}
+
+	dumpID, err := strconv.ParseInt(dumpIDStr, 10, 64)
+	if err != nil {
+		return 0, echo.NewHTTPError(http.StatusBadRequest, "Invalid dump_id")
+	}
+
+	return dumpID, nil
+}
+
 // ListDirectory returns the contents of a directory
 func (h *Handler) ListDirectory(c echo.Context) error {
 	path := c.QueryParam("path")
@@ -86,15 +102,9 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 		path = "/"
 	}
 
-	// Get the latest dump_id
-	var dumpID int64
-	err := h.db.QueryRow(`
-		SELECT dump_id FROM dumps 
-		ORDER BY created_at DESC 
-		LIMIT 1
-	`).Scan(&dumpID)
+	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get latest dump")
+		return err
 	}
 
 	rows, err := h.db.Query(`
@@ -159,15 +169,9 @@ func (h *Handler) GetFileMetadata(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Path parameter is required")
 	}
 
-	// Get the latest dump_id
-	var dumpID int64
-	err := h.db.QueryRow(`
-		SELECT dump_id FROM dumps 
-		ORDER BY created_at DESC 
-		LIMIT 1
-	`).Scan(&dumpID)
+	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get latest dump")
+		return err
 	}
 
 	var metadata FileMetadata
@@ -218,6 +222,11 @@ func (h *Handler) GetFileMetadata(c echo.Context) error {
 
 // GetStats returns statistics about the filesystem
 func (h *Handler) GetStats(c echo.Context) error {
+	dumpID, err := h.getDumpIDFromQuery(c)
+	if err != nil {
+		return err
+	}
+
 	var stats struct {
 		TotalFiles       int64  `json:"total_files"`
 		TotalDirectories int64  `json:"total_directories"`
@@ -228,7 +237,7 @@ func (h *Handler) GetStats(c echo.Context) error {
 		ScanTime         int64  `json:"scan_time"`
 	}
 
-	err := h.db.QueryRow(`
+	err = h.db.QueryRow(`
 		SELECT 
 			d.file_count,
 			d.directory_count,
@@ -238,9 +247,8 @@ func (h *Handler) GetStats(c echo.Context) error {
 			(SELECT COUNT(DISTINCT file_extension) FROM file_metadata WHERE dump_id = d.dump_id) as ext_count,
 			(SELECT MAX(modification_time_utc) FROM file_metadata WHERE dump_id = d.dump_id) as latest_mod
 		FROM dumps d
-		ORDER BY created_at DESC
-		LIMIT 1
-	`).Scan(
+		WHERE d.dump_id = ?
+	`, dumpID).Scan(
 		&stats.TotalFiles,
 		&stats.TotalDirectories,
 		&stats.TotalSize,
@@ -263,15 +271,9 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Pattern parameter is required")
 	}
 
-	// Get the latest dump_id
-	var dumpID int64
-	err := h.db.QueryRow(`
-		SELECT dump_id FROM dumps 
-		ORDER BY created_at DESC 
-		LIMIT 1
-	`).Scan(&dumpID)
+	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get latest dump")
+		return err
 	}
 
 	rows, err := h.db.Query(`
@@ -319,15 +321,9 @@ func (h *Handler) GetExtensionStats(c echo.Context) error {
 		limit = "10"
 	}
 
-	// Get the latest dump_id
-	var dumpID int64
-	err := h.db.QueryRow(`
-		SELECT dump_id FROM dumps 
-		ORDER BY created_at DESC 
-		LIMIT 1
-	`).Scan(&dumpID)
+	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get latest dump")
+		return err
 	}
 
 	rows, err := h.db.Query(`
@@ -382,15 +378,9 @@ func (h *Handler) GetDirectoryTree(c echo.Context) error {
 		depth = "1"
 	}
 
-	// Get the latest dump_id
-	var dumpID int64
-	err := h.db.QueryRow(`
-		SELECT dump_id FROM dumps 
-		ORDER BY created_at DESC 
-		LIMIT 1
-	`).Scan(&dumpID)
+	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get latest dump")
+		return err
 	}
 
 	rows, err := h.db.Query(`
@@ -441,15 +431,9 @@ func (h *Handler) GetDirectoryTree(c echo.Context) error {
 
 // AdvancedSearch performs advanced file search with multiple criteria
 func (h *Handler) AdvancedSearch(c echo.Context) error {
-	// Get the latest dump_id
-	var dumpID int64
-	err := h.db.QueryRow(`
-		SELECT dump_id FROM dumps 
-		ORDER BY created_at DESC 
-		LIMIT 1
-	`).Scan(&dumpID)
+	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get latest dump")
+		return err
 	}
 
 	// Build query conditions
@@ -607,15 +591,9 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 
 // GetCacheStatus returns the current status of caches
 func (h *Handler) GetCacheStatus(c echo.Context) error {
-	// Get the latest dump_id
-	var dumpID int64
-	err := h.db.QueryRow(`
-		SELECT dump_id FROM dumps 
-		ORDER BY created_at DESC 
-		LIMIT 1
-	`).Scan(&dumpID)
+	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get latest dump")
+		return err
 	}
 
 	rows, err := h.db.Query(`
