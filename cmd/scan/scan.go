@@ -87,23 +87,32 @@ func (c *Command) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface{}
 	amend := dumpInfo.IsAmend
 	processedPaths := dumpInfo.ProcessedPaths
 
-	// Start transaction for file metadata
-	tx, err := appCtx.DB.Begin()
-	if err != nil {
-		log.Fatalf("Failed to begin transaction: %v", err)
-	}
-	appCtx.Tx = tx
-
 	// Metadata processing channel setup
 	metadataChan := make(chan models.FileMetadata, 100)
 	appCtx.MetadataChan = metadataChan
 
 	// Database write goroutine
-	appCtx.Wg.Add(1)
-	go func() {
-		defer appCtx.Wg.Done()
+	const batchSize = 1000
+	var currentBatch int
+	var mu sync.Mutex
 
-		stmt, err := appCtx.Tx.Prepare(`
+	createNewTransaction := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if appCtx.Tx != nil {
+			if err := appCtx.Tx.Commit(); err != nil {
+				return err
+			}
+		}
+
+		tx, err := appCtx.DB.Begin()
+		if err != nil {
+			return err
+		}
+		appCtx.Tx = tx
+
+		stmt, err := tx.Prepare(`
 			INSERT INTO file_metadata (
 				dump_id, file_path, file_name, directory, size_bytes,
 				creation_time_utc, modification_time_utc, access_time_utc,
@@ -113,19 +122,37 @@ func (c *Command) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface{}
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`)
 		if err != nil {
-			log.Printf("Failed to prepare statement: %v", err)
-			appCtx.Cancel()
-			return
+			return err
+		}
+
+		if appCtx.Stmt != nil {
+			appCtx.Stmt.Close()
 		}
 		appCtx.Stmt = stmt
-		defer stmt.Close()
+		return nil
+	}
+
+	// Initial transaction
+	if err := createNewTransaction(); err != nil {
+		log.Fatalf("Failed to create initial transaction: %v", err)
+	}
+
+	appCtx.Wg.Add(1)
+	go func() {
+		defer appCtx.Wg.Done()
+		defer func() {
+			if appCtx.Stmt != nil {
+				appCtx.Stmt.Close()
+			}
+		}()
 
 		for metadata := range metadataChan {
 			select {
 			case <-appCtx.Context.Done():
 				return
 			default:
-				_, err := stmt.Exec(
+				mu.Lock()
+				_, err := appCtx.Stmt.Exec(
 					dumpID,
 					metadata.FilePath,
 					metadata.FileName,
@@ -145,11 +172,35 @@ func (c *Command) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface{}
 					metadata.FileExtension,
 					metadata.SHA256,
 				)
+				mu.Unlock()
+
 				if err != nil {
 					log.Printf("Error inserting metadata for %s: %v", metadata.FilePath, err)
+					continue
 				}
+
 				atomic.AddInt64(&appCtx.Stats.ProcessedBytes, metadata.SizeBytes)
+
+				currentBatch++
+				if currentBatch >= batchSize {
+					if err := createNewTransaction(); err != nil {
+						log.Printf("Error creating new transaction: %v", err)
+						appCtx.Cancel()
+						return
+					}
+					currentBatch = 0
+				}
 			}
+		}
+
+		// Final commit for the last batch
+		mu.Lock()
+		defer mu.Unlock()
+		if appCtx.Tx != nil {
+			if err := appCtx.Tx.Commit(); err != nil {
+				log.Printf("Error committing final batch: %v", err)
+			}
+			appCtx.Tx = nil
 		}
 	}()
 
@@ -210,10 +261,7 @@ func (c *Command) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface{}
 		log.Fatalf("Failed during file walk: %v", err)
 	}
 
-	// Final commit
-	if err := appCtx.Tx.Commit(); err != nil {
-		log.Fatalf("Failed to commit final transaction: %v", err)
-	}
+	appCtx.Wg.Wait()
 
 	// Log final statistics
 	elapsed := time.Since(appCtx.Stats.StartTime)
