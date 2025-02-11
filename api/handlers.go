@@ -76,6 +76,29 @@ type CacheStatus struct {
 	Status       string `json:"status"` // "REBUILD", "UPDATE", "FRESH"
 }
 
+// PaginatedResponse represents a paginated response
+type PaginatedResponse struct {
+	Data       interface{} `json:"data"`
+	Page       int         `json:"page"`
+	PerPage    int         `json:"per_page"`
+	Total      int         `json:"total"`
+	TotalPages int         `json:"total_pages"`
+	HasNext    bool        `json:"has_next"`
+}
+
+// NewPaginatedResponse creates a new paginated response
+func NewPaginatedResponse(data interface{}, page int, perPage int, total int) *PaginatedResponse {
+	totalPages := (total + perPage - 1) / perPage
+	return &PaginatedResponse{
+		Data:       data,
+		Page:       page,
+		PerPage:    perPage,
+		Total:      total,
+		TotalPages: totalPages,
+		HasNext:    page < totalPages,
+	}
+}
+
 func NewHandler(db *sql.DB) *Handler {
 	return &Handler{db: db}
 }
@@ -95,6 +118,25 @@ func (h *Handler) getDumpIDFromQuery(c echo.Context) (int64, error) {
 	return dumpID, nil
 }
 
+// getPageFromQuery gets and validates page number from query parameters
+func (h *Handler) getPageFromQuery(c echo.Context) (int, error) {
+	pageStr := c.QueryParam("page")
+	if pageStr == "" {
+		return 1, nil
+	}
+
+	page, err := strconv.Atoi(pageStr)
+	if err != nil {
+		return 0, echo.NewHTTPError(http.StatusBadRequest, "Invalid page number")
+	}
+
+	if page < 1 {
+		return 0, echo.NewHTTPError(http.StatusBadRequest, "Page number must be greater than 0")
+	}
+
+	return page, nil
+}
+
 // ListDirectory returns the contents of a directory
 func (h *Handler) ListDirectory(c echo.Context) error {
 	path := c.QueryParam("path")
@@ -105,6 +147,24 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 	dumpID, err := h.getDumpIDFromQuery(c)
 	if err != nil {
 		return err
+	}
+
+	page, err := h.getPageFromQuery(c)
+	if err != nil {
+		return err
+	}
+	perPage := 100
+	offset := (page - 1) * perPage
+
+	// Get total count first
+	var total int
+	err = h.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM file_metadata f1
+		WHERE directory = ? AND dump_id = ?
+	`, path, dumpID).Scan(&total)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
 	}
 
 	rows, err := h.db.Query(`
@@ -130,7 +190,8 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 			) as dir_count
 		FROM file_metadata f1
 		WHERE directory = ? AND dump_id = ?
-	`, path, dumpID)
+		LIMIT ? OFFSET ?
+	`, path, dumpID, perPage, offset)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to query directory")
 	}
@@ -159,7 +220,7 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 		entries = append(entries, entry)
 	}
 
-	return c.JSON(http.StatusOK, entries)
+	return c.JSON(http.StatusOK, NewPaginatedResponse(entries, page, perPage, total))
 }
 
 // GetFileMetadata returns detailed metadata for a specific file
@@ -276,6 +337,27 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 		return err
 	}
 
+	page, err := h.getPageFromQuery(c)
+	if err != nil {
+		return err
+	}
+	perPage := 100
+	offset := (page - 1) * perPage
+
+	// Get total count
+	var total int
+	err = h.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM file_metadata
+		WHERE dump_id = ? AND (
+			file_name LIKE ? OR
+			file_path LIKE ?
+		)
+	`, dumpID, "%"+pattern+"%", "%"+pattern+"%").Scan(&total)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
+	}
+
 	rows, err := h.db.Query(`
 		SELECT 
 			file_name,
@@ -288,8 +370,8 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 			file_name LIKE ? OR
 			file_path LIKE ?
 		)
-		LIMIT 100
-	`, dumpID, "%"+pattern+"%", "%"+pattern+"%")
+		LIMIT ? OFFSET ?
+	`, dumpID, "%"+pattern+"%", "%"+pattern+"%", perPage, offset)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to search files")
 	}
@@ -311,7 +393,7 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 		entries = append(entries, entry)
 	}
 
-	return c.JSON(http.StatusOK, entries)
+	return c.JSON(http.StatusOK, NewPaginatedResponse(entries, page, perPage, total))
 }
 
 // GetExtensionStats returns statistics about file extensions
@@ -436,14 +518,15 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 		return err
 	}
 
+	page, err := h.getPageFromQuery(c)
+	if err != nil {
+		return err
+	}
+	perPage := 100
+	offset := (page - 1) * perPage
+
 	// Build query conditions
-	query := `
-		SELECT 
-			file_name,
-			file_path,
-			is_directory,
-			size_bytes,
-			modification_time_utc
+	baseQuery := `
 		FROM file_metadata
 		WHERE dump_id = ?
 	`
@@ -451,39 +534,57 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 
 	// Size filters
 	if minSize := c.QueryParam("min_size"); minSize != "" {
-		query += " AND size_bytes >= ?"
+		baseQuery += " AND size_bytes >= ?"
 		params = append(params, minSize)
 	}
 	if maxSize := c.QueryParam("max_size"); maxSize != "" {
-		query += " AND size_bytes <= ?"
+		baseQuery += " AND size_bytes <= ?"
 		params = append(params, maxSize)
 	}
 
 	// Time filters
 	if modifiedAfter := c.QueryParam("modified_after"); modifiedAfter != "" {
-		query += " AND modification_time_utc >= ?"
+		baseQuery += " AND modification_time_utc >= ?"
 		params = append(params, modifiedAfter)
 	}
 	if modifiedBefore := c.QueryParam("modified_before"); modifiedBefore != "" {
-		query += " AND modification_time_utc <= ?"
+		baseQuery += " AND modification_time_utc <= ?"
 		params = append(params, modifiedBefore)
 	}
 
 	// File attributes
 	if isHidden := c.QueryParam("is_hidden"); isHidden != "" {
-		query += " AND is_hidden = ?"
+		baseQuery += " AND is_hidden = ?"
 		params = append(params, isHidden)
 	}
 	if isSymlink := c.QueryParam("is_symlink"); isSymlink != "" {
-		query += " AND is_symlink = ?"
+		baseQuery += " AND is_symlink = ?"
 		params = append(params, isSymlink)
 	}
 	if extension := c.QueryParam("extension"); extension != "" {
-		query += " AND file_extension = ?"
+		baseQuery += " AND file_extension = ?"
 		params = append(params, extension)
 	}
 
-	query += " LIMIT 100"
+	// Get total count
+	var total int
+	countParams := make([]interface{}, len(params))
+	copy(countParams, params)
+	err = h.db.QueryRow("SELECT COUNT(*) "+baseQuery, countParams...).Scan(&total)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
+	}
+
+	// Add pagination to the main query
+	params = append(params, perPage, offset)
+	query := `
+		SELECT 
+			file_name,
+			file_path,
+			is_directory,
+			size_bytes,
+			modification_time_utc
+	` + baseQuery + " LIMIT ? OFFSET ?"
 
 	rows, err := h.db.Query(query, params...)
 	if err != nil {
@@ -507,7 +608,7 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 		entries = append(entries, entry)
 	}
 
-	return c.JSON(http.StatusOK, entries)
+	return c.JSON(http.StatusOK, NewPaginatedResponse(entries, page, perPage, total))
 }
 
 // CompareDumps compares two dumps and returns changes
@@ -518,7 +619,14 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Both old_storage and new_storage parameters are required")
 	}
 
-	rows, err := h.db.Query(`
+	page, err := h.getPageFromQuery(c)
+	if err != nil {
+		return err
+	}
+	perPage := 100
+	offset := (page - 1) * perPage
+
+	baseQuery := `
 		WITH old_dump AS (
 			SELECT dump_id, file_path, size_bytes, modification_time_utc
 			FROM file_metadata
@@ -538,24 +646,39 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 				ORDER BY created_at DESC 
 				LIMIT 1
 			)
-		)
-		SELECT 
-			COALESCE(n.file_path, o.file_path) as file_path,
-			o.size_bytes as old_size,
-			n.size_bytes as new_size,
-			o.modification_time_utc as old_modified,
-			n.modification_time_utc as new_modified,
-			CASE
-				WHEN o.file_path IS NULL THEN 'added'
-				WHEN n.file_path IS NULL THEN 'deleted'
-				WHEN n.size_bytes != o.size_bytes OR n.modification_time_utc != o.modification_time_utc THEN 'modified'
-				ELSE 'unchanged'
-			END as status
-		FROM new_dump n
-		FULL OUTER JOIN old_dump o ON n.file_path = o.file_path
-		WHERE status != 'unchanged'
-		LIMIT 1000
-	`, oldStorage, newStorage)
+		),
+		comparison AS (
+			SELECT 
+				COALESCE(n.file_path, o.file_path) as file_path,
+				o.size_bytes as old_size,
+				n.size_bytes as new_size,
+				o.modification_time_utc as old_modified,
+				n.modification_time_utc as new_modified,
+				CASE
+					WHEN o.file_path IS NULL THEN 'added'
+					WHEN n.file_path IS NULL THEN 'deleted'
+					WHEN n.size_bytes != o.size_bytes OR n.modification_time_utc != o.modification_time_utc THEN 'modified'
+					ELSE 'unchanged'
+				END as status
+			FROM new_dump n
+			FULL OUTER JOIN old_dump o ON n.file_path = o.file_path
+			WHERE status != 'unchanged'
+		)`
+
+	// Get total count
+	var total int
+	err = h.db.QueryRow(`
+		SELECT COUNT(*) FROM comparison
+	`, oldStorage, newStorage).Scan(&total)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
+	}
+
+	// Get paginated results
+	rows, err := h.db.Query(baseQuery+`
+		SELECT * FROM comparison
+		LIMIT ? OFFSET ?
+	`, oldStorage, newStorage, perPage, offset)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to compare dumps")
 	}
@@ -586,7 +709,7 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 		changes = append(changes, change)
 	}
 
-	return c.JSON(http.StatusOK, changes)
+	return c.JSON(http.StatusOK, NewPaginatedResponse(changes, page, perPage, total))
 }
 
 // GetCacheStatus returns the current status of caches
