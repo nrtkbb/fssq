@@ -121,7 +121,7 @@ func (h *Handler) getDumpIDFromQuery(c echo.Context) (int64, error) {
 }
 
 // getPageFromQuery gets and validates page number from query parameters
-func (h *Handler) getPageFromQuery(c echo.Context) (int, error) {
+func (h *Handler) getPageFromQuery(c echo.Context, total int) (int, error) {
 	pageStr := c.QueryParam("page")
 	if pageStr == "" {
 		return 1, nil
@@ -134,6 +134,12 @@ func (h *Handler) getPageFromQuery(c echo.Context) (int, error) {
 
 	if page < 1 {
 		return 0, echo.NewHTTPError(http.StatusBadRequest, "Page number must be greater than 0")
+	}
+
+	perPage := 100
+	totalPages := (total + perPage - 1) / perPage
+	if page > totalPages {
+		return 0, echo.NewHTTPError(http.StatusBadRequest, "Page number exceeds total pages")
 	}
 
 	return page, nil
@@ -159,16 +165,9 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 	}
 	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
-	page, err := h.getPageFromQuery(c)
-	if err != nil {
-		return err
-	}
-	perPage := 100
-	offset := (page - 1) * perPage
-
 	// Get total count first
 	var total int
-	err = h.db.QueryRow(`
+	err = h.db.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM file_metadata f1
 		WHERE directory = ? AND dump_id = ?
@@ -176,6 +175,13 @@ func (h *Handler) ListDirectory(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
 	}
+
+	page, err := h.getPageFromQuery(c, total)
+	if err != nil {
+		return err
+	}
+	perPage := 100
+	offset := (page - 1) * perPage
 
 	rows, err := h.db.Query(`
 		SELECT 
@@ -374,16 +380,9 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 	}
 	span.SetAttributes(attribute.Int64("dump_id", dumpID))
 
-	page, err := h.getPageFromQuery(c)
-	if err != nil {
-		return err
-	}
-	perPage := 100
-	offset := (page - 1) * perPage
-
 	// Get total count
 	var total int
-	err = h.db.QueryRow(`
+	err = h.db.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM file_metadata
 		WHERE dump_id = ? AND (
@@ -394,6 +393,13 @@ func (h *Handler) SearchFiles(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
 	}
+
+	page, err := h.getPageFromQuery(c, total)
+	if err != nil {
+		return err
+	}
+	perPage := 100
+	offset := (page - 1) * perPage
 
 	rows, err := h.db.Query(`
 		SELECT 
@@ -590,13 +596,6 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 		span.SetAttributes(attribute.String("extension", extension))
 	}
 
-	page, err := h.getPageFromQuery(c)
-	if err != nil {
-		return err
-	}
-	perPage := 100
-	offset := (page - 1) * perPage
-
 	// Build query conditions
 	baseQuery := `
 		FROM file_metadata
@@ -642,10 +641,17 @@ func (h *Handler) AdvancedSearch(c echo.Context) error {
 	var total int
 	countParams := make([]interface{}, len(params))
 	copy(countParams, params)
-	err = h.db.QueryRow("SELECT COUNT(*) "+baseQuery, countParams...).Scan(&total)
+	err = h.db.QueryRowContext(ctx, "SELECT COUNT(*) "+baseQuery, countParams...).Scan(&total)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
 	}
+
+	page, err := h.getPageFromQuery(c, total)
+	if err != nil {
+		return err
+	}
+	perPage := 100
+	offset := (page - 1) * perPage
 
 	// Add pagination to the main query
 	params = append(params, perPage, offset)
@@ -702,7 +708,16 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 		attribute.String("new_storage", newStorage),
 	)
 
-	page, err := h.getPageFromQuery(c)
+	// Get total count
+	var total int
+	err := h.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM comparison
+	`, oldStorage, newStorage).Scan(&total)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
+	}
+
+	page, err := h.getPageFromQuery(c, total)
 	if err != nil {
 		return err
 	}
@@ -747,15 +762,6 @@ func (h *Handler) CompareDumps(c echo.Context) error {
 			FULL OUTER JOIN old_dump o ON n.file_path = o.file_path
 			WHERE status != 'unchanged'
 		)`
-
-	// Get total count
-	var total int
-	err = h.db.QueryRow(`
-		SELECT COUNT(*) FROM comparison
-	`, oldStorage, newStorage).Scan(&total)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get total count")
-	}
 
 	// Get paginated results
 	rows, err := h.db.Query(baseQuery+`
