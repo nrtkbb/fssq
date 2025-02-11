@@ -99,7 +99,7 @@ func (h *Handler) getDumpIDFromQuery(c echo.Context) (int64, error) {
 func (h *Handler) ListDirectory(c echo.Context) error {
 	path := c.QueryParam("path")
 	if path == "" {
-		path = "/"
+		path = "."
 	}
 
 	dumpID, err := h.getDumpIDFromQuery(c)
@@ -370,7 +370,7 @@ func (h *Handler) GetExtensionStats(c echo.Context) error {
 func (h *Handler) GetDirectoryTree(c echo.Context) error {
 	path := c.QueryParam("path")
 	if path == "" {
-		path = "/"
+		path = "."
 	}
 
 	depth := c.QueryParam("depth")
