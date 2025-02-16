@@ -7,23 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/nrtkbb/fssq/models"
-	"golang.org/x/sys/unix"
 )
 
 func CollectMetadata(path string, info os.FileInfo, relPath string, skipHash bool) models.FileMetadata {
-	stat := info.Sys().(*syscall.Stat_t)
-
-	// Get macOS-specific attributes
-	var isSystem, isArchive bool
-	finderInfo := make([]byte, 32)
-	_, err := unix.Getxattr(path, "com.apple.FinderInfo", finderInfo)
-	if err == nil {
-		isSystem = finderInfo[8]&uint8(0x04) != 0  // kIsSystemFileBit
-		isArchive = finderInfo[8]&uint8(0x20) != 0 // kIsArchiveBit
-	}
+	isSystem, isArchive := getPlatformSpecificAttributes(path)
+	creation, modification, access := getFileTimes(info.Sys())
 
 	// Calculate SHA256 hash (only for files)
 	var sha256Hash *string
@@ -38,9 +28,9 @@ func CollectMetadata(path string, info os.FileInfo, relPath string, skipHash boo
 		FileName:            info.Name(),
 		Directory:           filepath.Dir(relPath),
 		SizeBytes:           info.Size(),
-		CreationTimeUTC:     stat.Birthtimespec.Sec,
-		ModificationTimeUTC: stat.Mtimespec.Sec,
-		AccessTimeUTC:       stat.Atimespec.Sec,
+		CreationTimeUTC:     creation,
+		ModificationTimeUTC: modification,
+		AccessTimeUTC:       access,
 		FileMode:            FormatFileMode(info.Mode()),
 		IsDirectory:         info.IsDir(),
 		IsFile:              !info.IsDir(),

@@ -1,4 +1,5 @@
 fssq
+fssq.exe
 /testdata
 *.db
 *.db-journal
