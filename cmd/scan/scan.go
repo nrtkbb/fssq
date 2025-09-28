@@ -59,7 +59,7 @@ func (c *Command) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.dbPath, "db", "", "database file path (required)")
 	f.StringVar(&c.rootDir, "root", "", "directory to scan (required)")
 	f.StringVar(&c.storageName, "storage", "", "storage name identifier (required)")
-	f.BoolVar(&c.skipHash, "skip-hash", false, "skip SHA256 calculation")
+	f.BoolVar(&c.skipHash, "skip-hash", false, "skip weak ETag calculation")
 	f.BoolVar(&c.amend, "amend", false, "amend existing dump")
 }
 

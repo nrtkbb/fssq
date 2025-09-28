@@ -9,10 +9,11 @@ fssq is a high-performance tool for analyzing file system metadata through SQLit
 - Comprehensive file metadata collection:
   - Core attributes (name, path, size, timestamps)
   - File properties (directory, symlink, hidden, system flags)
-  - Content verification (SHA256 hashing)
+  - Content verification (weak ETag generation)
 - Advanced SQL querying capabilities
 - Real-time progress monitoring
 - Database merge functionality
+- Fast weak ETag calculation (no file content reading required)
 
 ## Installation
 
@@ -45,7 +46,7 @@ Flags:
   -root string     Directory to scan (required)
   -storage string  Storage name identifier (required)
   -workers int     Number of parallel workers (default 4)
-  -skip-hash       Skip SHA256 calculation
+  -skip-hash       Skip weak ETag calculation
 ```
 
 ### Merge Command
@@ -61,11 +62,14 @@ Flags:
 ## Example Queries
 
 ```sql
--- Find duplicate files
-SELECT sha256, COUNT(*) as copies, SUM(size_bytes) as total_size
+-- Find potential duplicate files by size and modification time
+SELECT 
+    SUBSTR(sha256, 4, LENGTH(sha256)-5) as etag_content,
+    COUNT(*) as copies, 
+    SUM(size_bytes) as total_size
 FROM file_metadata
-WHERE sha256 IS NOT NULL
-GROUP BY sha256
+WHERE sha256 IS NOT NULL AND sha256 LIKE 'W/"%'
+GROUP BY etag_content
 HAVING COUNT(*) > 1
 ORDER BY total_size DESC;
 

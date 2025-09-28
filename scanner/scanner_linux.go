@@ -4,7 +4,7 @@
 package scanner
 
 import (
-	"golang.org/x/sys/unix"
+	"syscall"
 )
 
 func getPlatformSpecificAttributes(path string) (isSystem bool, isArchive bool) {
@@ -17,7 +17,7 @@ func getFileTimes(stat interface{}) (creation int64, modification int64, access 
 	if stat == nil {
 		return 0, 0, 0
 	}
-	statT := stat.(*unix.Stat_t)
+	statT := stat.(*syscall.Stat_t)
 	// Linux doesn't have a creation time in the standard stat structure
 	// Use modification time as creation time
 	return statT.Mtim.Sec, statT.Mtim.Sec, statT.Atim.Sec
