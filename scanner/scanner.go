@@ -1,9 +1,7 @@
 package scanner
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"io"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,12 +13,11 @@ func CollectMetadata(path string, info os.FileInfo, relPath string, skipHash boo
 	isSystem, isArchive := getPlatformSpecificAttributes(path)
 	creation, modification, access := getFileTimes(info.Sys())
 
-	// Calculate SHA256 hash (only for files)
-	var sha256Hash *string
+	// Calculate weak ETag (only for files)
+	var weakETag *string
 	if !skipHash && !info.IsDir() {
-		if hash, err := CalculateSHA256(path); err == nil {
-			sha256Hash = &hash
-		}
+		etag := CalculateWeakETag(info)
+		weakETag = &etag
 	}
 
 	return models.FileMetadata{
@@ -40,23 +37,16 @@ func CollectMetadata(path string, info os.FileInfo, relPath string, skipHash boo
 		IsArchive:           isArchive,
 		IsReadonly:          info.Mode()&0200 == 0,
 		FileExtension:       strings.ToLower(filepath.Ext(path)),
-		SHA256:              sha256Hash,
+		SHA256:              weakETag,
 	}
 }
 
-func CalculateSHA256(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-
-	return hex.EncodeToString(hash.Sum(nil)), nil
+// CalculateWeakETag generates a weak ETag based on file metadata (size + mtime)
+// This is similar to NGINX's weak ETag approach and avoids reading file contents
+func CalculateWeakETag(info os.FileInfo) string {
+	// Format: W/"<size>-<mtime_hex>"
+	// Using hexadecimal representation of modification time for compactness
+	return fmt.Sprintf("W/\"%x-%x\"", info.Size(), info.ModTime().Unix())
 }
 
 func FormatFileMode(mode os.FileMode) string {
